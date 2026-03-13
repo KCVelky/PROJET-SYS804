@@ -85,6 +85,7 @@ class AnalysisTab(QWidget):
         self.btn_rigidity = QPushButton("Tracer rigidité de flexion")
         self.btn_mesh = QPushButton("Tracer maillage")
         self.btn_modal = QPushButton("Tracer mode propre")
+        self.btn_modal_cut = QPushButton("Coupe modale centrée sur le trou noir")
         self.btn_modal_compare = QPushButton("Comparer les fréquences propres")
         self.btn_frf = QPushButton("Tracer FRF modale")
         self.btn_frf_compare = QPushButton("Comparer les FRF modales")
@@ -94,6 +95,7 @@ class AnalysisTab(QWidget):
             self.btn_rigidity,
             self.btn_mesh,
             self.btn_modal,
+            self.btn_modal_cut,
             self.btn_modal_compare,
             self.btn_frf,
             self.btn_frf_compare,
@@ -129,6 +131,7 @@ class AnalysisTab(QWidget):
         self.btn_modal_compare.clicked.connect(self.compare_modal)
         self.btn_frf.clicked.connect(self.plot_frf_modal)
         self.btn_frf_compare.clicked.connect(self.compare_frf_modal)
+        self.btn_modal_cut.clicked.connect(self.plot_mode_cut_centered)
 
     def refresh_sensor_list(self) -> None:
         current = self.sensor_combo.currentText()
@@ -294,6 +297,164 @@ class AnalysisTab(QWidget):
         self.log("Fréquences propres :")
         for i, f in enumerate(freqs, start=1):
             self.log(f"  Mode {i:02d} : {f:.3f} Hz")
+    
+    def _extract_x_cut_from_mode(self, model, mode_vector: np.ndarray, y_target: float):
+        """
+        Extrait une coupe suivant x à y = y_target (ou au y maillé le plus proche).
+        """
+        mesh = model.mesh
+        nx = len(mesh.x_coords)
+        ny = len(mesh.y_coords)
+
+        w = mode_vector[0::3].reshape(ny, nx)
+        h = mesh.thickness_nodal.reshape(ny, nx)
+
+        j = int(np.argmin(np.abs(mesh.y_coords - y_target)))
+
+        x_cut = mesh.x_coords.copy()
+        y_cut = float(mesh.y_coords[j])
+        w_cut = w[j, :].copy()
+        h_cut = h[j, :].copy()
+
+        return x_cut, y_cut, w_cut, h_cut
+
+
+    def plot_mode_cut_centered(self) -> None:
+        if not self._prepare():
+            return
+
+        n_modes = max(self.n_modes_spin.value(), self.mode_to_plot_spin.value())
+
+        self.log("Calcul modal pour coupe centrée...")
+        result = self.manager.run_modal_analysis(
+            n_modes=n_modes,
+            use_black_hole=self.use_black_hole_checkbox.isChecked(),
+            refine_with_black_hole_region=True,
+            rebuild=True,
+        )
+
+        mode_id = self.mode_to_plot_spin.value() - 1
+        freqs = result["frequencies_hz"]
+
+        if mode_id >= len(freqs):
+            self.log("Le mode demandé n'est pas disponible.")
+            return
+
+        model = result["model"]
+        plate = self.manager.build_plate()
+        bh = plate.black_hole
+
+        # centre de coupe
+        if bh is not None:
+            xc = bh.xc
+            yc = bh.yc
+            radius = bh.radius
+            trunc = bh.truncation_radius
+        else:
+            xc = plate.Lx / 2.0
+            yc = plate.Ly / 2.0
+            radius = 0.0
+            trunc = 0.0
+
+        mode_vec = result["modes_full"][:, mode_id]
+
+        x_cut, y_cut, w_cut, h_cut = self._extract_x_cut_from_mode(
+            model=model,
+            mode_vector=mode_vec,
+            y_target=yc,
+        )
+
+        # normalisation par l'amplitude transverse globale du mode
+        w_global = mode_vec[0::3]
+        norm = np.max(np.abs(w_global))
+        if norm < 1e-15:
+            self.log("Amplitude modale quasi nulle, impossible à tracer.")
+            return
+
+        w_cut_norm = w_cut / norm
+
+        x_mm = x_cut * 1e3
+        h_mm = h_cut * 1e3
+        xc_mm = xc * 1e3
+        yc_mm = y_cut * 1e3
+        radius_mm = radius * 1e3
+        trunc_mm = trunc * 1e3
+
+        # amplification visuelle de la déformée
+        h_max_mm = float(np.max(h_mm))
+        visual_amp_mm = max(0.6 * h_max_mm, 0.5)
+
+        z_def_mm = visual_amp_mm * w_cut_norm
+
+        z_top_undef = +0.5 * h_mm
+        z_bot_undef = -0.5 * h_mm
+
+        z_top_def = z_def_mm + 0.5 * h_mm
+        z_bot_def = z_def_mm - 0.5 * h_mm
+
+        # fenêtre zoomée autour du trou noir
+        if bh is not None:
+            half_window_mm = max(2.0 * radius_mm, 80.0)
+        else:
+            half_window_mm = 120.0
+
+        x_min_zoom = max(0.0, xc_mm - half_window_mm)
+        x_max_zoom = min(plate.Lx * 1e3, xc_mm + half_window_mm)
+
+        self.canvas.figure.clear()
+
+        ax1 = self.canvas.figure.add_subplot(211)
+        ax2 = self.canvas.figure.add_subplot(212)
+
+        # -----------------------
+        # 1) coupe modale amplitude
+        # -----------------------
+        ax1.plot(x_mm, w_cut_norm, linewidth=2, label="Déplacement modal normalisé")
+        ax1.axhline(0.0, color="k", linewidth=0.8)
+
+        if bh is not None:
+            ax1.axvline(xc_mm - radius_mm, linestyle="--", linewidth=1.5, color="r", label="Rayon extérieur")
+            ax1.axvline(xc_mm + radius_mm, linestyle="--", linewidth=1.5, color="r")
+            ax1.axvline(xc_mm - trunc_mm, linestyle="--", linewidth=1.2, color="k", label="Troncature")
+            ax1.axvline(xc_mm + trunc_mm, linestyle="--", linewidth=1.2, color="k")
+
+        ax1.set_title(
+            f"Coupe modale suivant x à y = {yc_mm:.2f} mm | Mode {mode_id + 1} | f = {freqs[mode_id]:.3f} Hz"
+        )
+        ax1.set_xlabel("x [mm]")
+        ax1.set_ylabel("w normalisé [-]")
+        ax1.grid(True, alpha=0.3)
+        ax1.legend(loc="best")
+
+        # -----------------------
+        # 2) vue de profil de coupe
+        # -----------------------
+        ax2.plot(x_mm, z_top_undef, "--", linewidth=1.2, color="gray", label="Plaque non déformée")
+        ax2.plot(x_mm, z_bot_undef, "--", linewidth=1.2, color="gray")
+
+        ax2.plot(x_mm, z_top_def, linewidth=2.0, color="tab:blue", label="Plaque déformée (amplifiée)")
+        ax2.plot(x_mm, z_bot_def, linewidth=2.0, color="tab:blue")
+        ax2.plot(x_mm, z_def_mm, linewidth=1.5, color="tab:orange", label="Fibre moyenne déformée")
+
+        if bh is not None:
+            ax2.axvline(xc_mm - radius_mm, linestyle="--", linewidth=1.5, color="r", label="Rayon extérieur")
+            ax2.axvline(xc_mm + radius_mm, linestyle="--", linewidth=1.5, color="r")
+            ax2.axvline(xc_mm - trunc_mm, linestyle="--", linewidth=1.2, color="k", label="Troncature")
+            ax2.axvline(xc_mm + trunc_mm, linestyle="--", linewidth=1.2, color="k")
+
+        ax2.set_xlim(x_min_zoom, x_max_zoom)
+        ax2.set_title("Vue de coupe centrée sur le trou noir vibratoire")
+        ax2.set_xlabel("x [mm]")
+        ax2.set_ylabel("z [mm] (déformée amplifiée)")
+        ax2.grid(True, alpha=0.3)
+        ax2.legend(loc="best")
+
+        self.canvas.draw_idle()
+
+        self.log(
+            f"Coupe modale tracée à y = {yc_mm:.2f} mm "
+            f"(centre trou noir visé : y = {yc * 1e3:.2f} mm)."
+        )
 
     def compare_modal(self) -> None:
         if not self._prepare():
