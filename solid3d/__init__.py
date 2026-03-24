@@ -15,3 +15,11 @@ from .boundary_conditions_3d import (
 )
 from .fem_model_3d import Solid3DFEMModel
 from .modal_solver_3d import ModalBasis3D, ModalSolver3D
+from .results_3d import ModalValidationPerMode3D, ModalValidationResult3D
+from .modal_validation_3d import ModalValidation3D
+
+from .modal_comparison_3d import (
+    ModeComparison3D,
+    ModalComparisonResult3D,
+    ModalComparison3D,
+)

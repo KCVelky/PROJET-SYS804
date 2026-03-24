@@ -1,3 +1,2 @@
-# core/__init__.py
-
 from .simulation_manager import SimulationManager
+from .simulation_manager_3d import SimulationManager3D
