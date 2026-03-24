@@ -44,18 +44,17 @@ def main() -> None:
     # Commence volontairement plus grossier que ton preview 3D,
     # sinon l'assemblage/modal peut devenir très lourd.
     mesh_options = Solid3DMeshOptions(
-        element_order=1,
-        global_size=0.050,
-        local_size=0.015,
-        local_refinement_radius=0.020,
-        transition_thickness=0.020,
+        element_order=2,
+        global_size=0.012,
+        local_size=0.004,
+        local_refinement_radius=0.030,
+        transition_thickness=0.010,
         top_surface_nu=17,
         top_surface_nv=13,
         algorithm_3d=10,
         save_msh_path="outputs/plate_abh_3d_modal.msh",
-        optimize_high_order=True,
-        high_order_opt_mode=2,
-)
+        optimize_high_order=False,
+    )
 
     model = Solid3DFEMModel(
         plate=plate,

@@ -17,7 +17,7 @@ def build_plate() -> Plate:
         residual_thickness=0.0003,
         exponent=2.0,
         enabled=True,
-    )
+    ) 
 
     plate = Plate(
         length_x=0.50,

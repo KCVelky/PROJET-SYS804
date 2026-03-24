@@ -64,6 +64,10 @@ class Solid3DFEMModel:
         )
         self.mesh = mesher.generate(self.mesh_options)
 
+        used_nodes = np.unique(self.mesh.cells.ravel())
+        print("Noeuds utilisés  :", len(used_nodes))
+        print("Noeuds stockés   :", self.mesh.n_points)
+
         if self.verbose:
             print("Points maillage   :", self.mesh.n_points)
             print("Cellules maillage :", self.mesh.n_cells)

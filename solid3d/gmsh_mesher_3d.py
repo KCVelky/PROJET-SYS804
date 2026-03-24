@@ -72,7 +72,16 @@ class GmshABH3DMesher:
     def _optimize_high_order_mesh(self, options: Solid3DMeshOptions) -> None:
         import gmsh
 
-        if options.element_order <= 1 or not options.optimize_high_order:
+        if options.element_order <= 1:
+            return
+
+        # important : Tetra10 droit, pas courbe
+        gmsh.option.setNumber("Mesh.SecondOrderLinear", 1)
+
+        gmsh.model.mesh.setOrder(options.element_order)
+
+        # pour le premier debug : ne pas relancer l'optimisation high-order
+        if not options.optimize_high_order:
             return
 
         gmsh.option.setNumber("Mesh.HighOrderOptimize", options.high_order_opt_mode)
@@ -84,13 +93,8 @@ class GmshABH3DMesher:
         gmsh.option.setNumber("Mesh.HighOrderPrimSurfMesh", options.high_order_prim_surf_mesh)
         gmsh.option.setNumber("Mesh.HighOrderIterMax", options.high_order_iter_max)
 
-        # 1) montée en ordre
-        gmsh.model.mesh.setOrder(options.element_order)
-
-        # 2) lissage/optimisation high-order
-        # Gmsh documente explicitement les méthodes HighOrder et HighOrderElastic.
-        gmsh.model.mesh.optimize("HighOrderElastic", force=True, niter=2)
-        gmsh.model.mesh.optimize("HighOrder", force=True, niter=2)
+        gmsh.model.mesh.optimize("HighOrderElastic", force=True, niter=1)
+        gmsh.model.mesh.optimize("HighOrder", force=True, niter=1)
         
     def __init__(
         self,
@@ -322,19 +326,23 @@ class GmshABH3DMesher:
 
     def _extract_best_tetra_block(self, requested_order: int) -> Mesh3DData:
         """
-        Extrait le bloc volumique tétraédrique le plus pertinent dans le maillage Gmsh.
+        Extrait tous les blocs tétraédriques volumiques pertinents
+        et compacte les nœuds réellement utilisés.
         """
         import gmsh
+        import numpy as np
 
-        node_tags, node_coords, _ = gmsh.model.mesh.getNodes()
-        points = np.asarray(node_coords, dtype=float).reshape(-1, 3)
-        node_tags = np.asarray(node_tags, dtype=np.int64)
+        # Tous les nœuds du maillage Gmsh
+        node_tags_all, node_coords_all, _ = gmsh.model.mesh.getNodes()
+        points_all = np.asarray(node_coords_all, dtype=float).reshape(-1, 3)
+        node_tags_all = np.asarray(node_tags_all, dtype=np.int64)
 
-        tag_to_index = {int(tag): i for i, tag in enumerate(node_tags.tolist())}
+        tag_to_global = {int(tag): i for i, tag in enumerate(node_tags_all.tolist())}
 
+        # Tous les éléments volumiques
         element_types, element_tags_blocks, element_node_tags_blocks = gmsh.model.mesh.getElements(dim=3)
 
-        candidate_blocks: list[dict] = []
+        candidate_blocks = []
 
         for etype, etags, enodes in zip(element_types, element_tags_blocks, element_node_tags_blocks):
             name, dim, order, num_nodes, *_ = gmsh.model.mesh.getElementProperties(etype)
@@ -361,26 +369,52 @@ class GmshABH3DMesher:
         if not candidate_blocks:
             raise RuntimeError("Aucun bloc tétraédrique 3D n'a été trouvé dans le maillage Gmsh.")
 
-        # priorité : ordre demandé, sinon ordre le plus élevé disponible
+        # On garde TOUS les blocs de l'ordre demandé ;
+        # sinon tous les blocs de l'ordre max disponible
         exact = [b for b in candidate_blocks if b["order"] == requested_order]
         if exact:
-            block = exact[0]
+            selected = exact
         else:
-            block = sorted(candidate_blocks, key=lambda b: b["order"], reverse=True)[0]
+            max_order = max(b["order"] for b in candidate_blocks)
+            selected = [b for b in candidate_blocks if b["order"] == max_order]
 
-        conn = np.vectorize(tag_to_index.__getitem__, otypes=[np.int64])(block["element_node_tags"])
+        # Si plusieurs types existent, on garde celui avec le plus de nœuds/élément
+        max_num_nodes = max(b["num_nodes"] for b in selected)
+        selected = [b for b in selected if b["num_nodes"] == max_num_nodes]
+
+        num_nodes = int(selected[0]["num_nodes"])
+        order = int(selected[0]["order"])
+        gmsh_element_type = int(selected[0]["gmsh_element_type"])
+        name = selected[0]["name"]
+
+        element_tags = np.concatenate([b["element_tags"] for b in selected])
+        element_node_tags = np.vstack([b["element_node_tags"] for b in selected])
+
+        # Remappage Gmsh Tetra10 -> ordre interne attendu
+        # interne : [1,2,3,4,12,23,31,14,24,34]
+        if num_nodes == 10:
+            element_node_tags = element_node_tags[:, [0, 1, 2, 3, 4, 5, 6, 7, 9, 8]]
+
+        # Compactage : on ne garde que les nœuds réellement utilisés
+        used_node_tags = np.unique(element_node_tags.ravel())
+        used_global_idx = np.array([tag_to_global[int(tag)] for tag in used_node_tags], dtype=np.int64)
+        points = points_all[used_global_idx]
+
+        tag_to_local = {int(tag): i for i, tag in enumerate(used_node_tags.tolist())}
+        conn = np.vectorize(tag_to_local.__getitem__, otypes=[np.int64])(element_node_tags)
 
         return Mesh3DData(
             points=points,
             cells=conn,
-            n_nodes_per_cell=block["num_nodes"],
-            gmsh_element_type=block["gmsh_element_type"],
-            element_order=block["order"],
-            node_tags_gmsh=node_tags,
-            element_tags_gmsh=block["element_tags"],
+            n_nodes_per_cell=num_nodes,
+            gmsh_element_type=gmsh_element_type,
+            element_order=order,
+            node_tags_gmsh=used_node_tags,
+            element_tags_gmsh=element_tags,
             metadata={
-                "gmsh_element_name": block["name"],
+                "gmsh_element_name": name,
                 "requested_order": requested_order,
+                "n_blocks_merged": len(selected),
             },
         )
 
