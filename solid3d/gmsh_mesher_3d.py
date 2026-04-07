@@ -30,6 +30,7 @@ class Solid3DMeshOptions:
 
     algorithm_3d: int = 10
     save_msh_path: str | None = None
+    reuse_saved_msh: bool = True
 
     # --- options high-order ---
     optimize_high_order: bool = True
@@ -423,13 +424,20 @@ class GmshABH3DMesher:
     # ------------------------------------------------------------------
 
     def generate(self, options: Solid3DMeshOptions) -> Mesh3DData:
-        """
-        Génère le maillage 3D avec Gmsh et renvoie les données du maillage.
-        """
         import gmsh
+
+        msh_path = Path(options.save_msh_path) if options.save_msh_path else None
 
         gmsh.initialize()
         try:
+            if (
+                msh_path is not None
+                and options.reuse_saved_msh
+                and msh_path.exists()
+            ):
+                gmsh.open(str(msh_path))
+                return self._extract_best_tetra_block(requested_order=options.element_order)
+
             gmsh.model.add(self.model_name)
 
             self._build_occ_volume(options)
@@ -438,13 +446,11 @@ class GmshABH3DMesher:
             gmsh.model.mesh.generate(3)
             self._optimize_high_order_mesh(options)
 
-            if options.save_msh_path:
-                out = Path(options.save_msh_path)
-                out.parent.mkdir(parents=True, exist_ok=True)
-                gmsh.write(str(out))
+            if msh_path is not None:
+                msh_path.parent.mkdir(parents=True, exist_ok=True)
+                gmsh.write(str(msh_path))
 
-            mesh = self._extract_best_tetra_block(requested_order=options.element_order)
-            return mesh
+            return self._extract_best_tetra_block(requested_order=options.element_order)
 
         finally:
             gmsh.finalize()

@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from solvers.damping import RayleighDamping
 from solid3d.fem_model_3d import Solid3DFEMModel
 from solid3d.modal_solver_3d import ModalBasis3D, ModalSolver3D
 from solid3d.probes_3d import (
@@ -41,16 +42,6 @@ class ModalFRFResult3D:
 
 
 class ModalFRFSolver3D:
-    """
-    FRF 3D par superposition modale :
-    q(omega) ≈ Phi * eta(omega)
-
-    Hypothèses :
-    - base modale tronquée
-    - modes mass-normalisés
-    - amortissement modal diagonal
-    """
-
     def __init__(self, fem_model: Solid3DFEMModel, verbose: bool = True) -> None:
         self.model = fem_model
         self.verbose = verbose
@@ -67,13 +58,19 @@ class ModalFRFSolver3D:
 
     @staticmethod
     def _prepare_modal_damping(
-        damping_ratio: float | np.ndarray,
-        n_modes: int,
+        damping: float | np.ndarray | RayleighDamping,
+        omegas_rad_s: np.ndarray,
     ) -> np.ndarray:
-        if np.isscalar(damping_ratio):
-            zeta = np.full(n_modes, float(damping_ratio), dtype=float)
+        n_modes = omegas_rad_s.shape[0]
+
+        if isinstance(damping, RayleighDamping):
+            alpha = float(damping.alpha)
+            beta = float(damping.beta)
+            zeta = 0.5 * (alpha / omegas_rad_s + beta * omegas_rad_s)
+        elif np.isscalar(damping):
+            zeta = np.full(n_modes, float(damping), dtype=float)
         else:
-            zeta = np.asarray(damping_ratio, dtype=float)
+            zeta = np.asarray(damping, dtype=float)
             if zeta.shape[0] != n_modes:
                 raise ValueError("Le tableau des amortissements modaux n'a pas la bonne taille.")
 
@@ -87,11 +84,11 @@ class ModalFRFSolver3D:
         excitation: HarmonicPointForce3D,
         sensor: PointSensor3D,
         n_modes: int = 30,
-        damping_ratio: float | np.ndarray = 0.01,
+        damping: float | np.ndarray | RayleighDamping = 0.01,
         modal_basis: ModalBasis3D | None = None,
     ) -> ModalFRFResult3D:
-        if self.model.Kff is None or self.model.Mff is None or self.model.free_dofs is None:
-            raise RuntimeError("Le modèle 3D doit être construit avant le calcul FRF modal.")
+        if self.model.free_dofs is None:
+            raise RuntimeError("Le modèle 3D doit avoir ses ddl libres avant le calcul FRF modal.")
 
         frequencies_hz = np.linspace(
             excitation.frequency_start,
@@ -109,7 +106,7 @@ class ModalFRFSolver3D:
 
         Phi = modal_basis.modes_free[:, :n_used]
         wn = modal_basis.omegas_rad_s[:n_used]
-        zeta = self._prepare_modal_damping(damping_ratio, n_used)
+        zeta = self._prepare_modal_damping(damping, wn)
 
         force_vector, f_complex, excitation_node_id, excitation_distance, excitation_dof_id = (
             build_force_vector_3d(self.model, excitation)
@@ -117,7 +114,6 @@ class ModalFRFSolver3D:
         sensor_dof_id, sensor_node_id, sensor_distance = get_sensor_dof_3d(self.model, sensor)
 
         force_free = force_vector[self.model.free_dofs]
-
         modal_forces = Phi.conj().T @ force_free
 
         sensor_pos_free = self._full_to_free_position(sensor_dof_id)
@@ -130,7 +126,6 @@ class ModalFRFSolver3D:
 
         denom = wn_col**2 - omega_row**2 + 2j * zeta_col * wn_col * omega_row
         eta = modal_forces[:, None] / denom
-
         displacement_complex = phi_sensor @ eta
 
         if sensor.response_type == "displacement":

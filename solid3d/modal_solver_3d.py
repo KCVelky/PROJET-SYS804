@@ -1,8 +1,7 @@
-# solid3d/modal_solver_3d.py
-
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 from scipy.sparse.linalg import eigsh
@@ -21,11 +20,6 @@ class ModalBasis3D:
 
 
 class ModalSolver3D:
-    """
-    Solveur modal 3D :
-    Kff phi = lambda Mff phi
-    """
-
     def __init__(self, fem_model: Solid3DFEMModel, verbose: bool = True) -> None:
         self.model = fem_model
         self.verbose = verbose
@@ -38,8 +32,6 @@ class ModalSolver3D:
         if n_free <= 1:
             raise RuntimeError("Pas assez de ddl libres pour un calcul modal.")
 
-        # Pour un cas free, on peut récupérer des modes rigides proches de 0 ;
-        # on demande un peu plus de modes pour avoir assez de modes positifs.
         extra = 6 if self.model.plate.boundary_condition == "free" else 0
         k = min(max(1, n_modes + extra), n_free - 2)
 
@@ -67,7 +59,6 @@ class ModalSolver3D:
         eigvals = np.real(eigvals)
         eigvecs = np.real(eigvecs)
 
-        # filtre des valeurs propres positives
         positive = eigvals > 1e-8
         eigvals = eigvals[positive]
         eigvecs = eigvecs[:, positive]
@@ -79,7 +70,6 @@ class ModalSolver3D:
         if eigvals.size == 0:
             raise RuntimeError("Aucune valeur propre positive n'a été trouvée.")
 
-        # on tronque au nombre demandé
         eigvals = eigvals[:n_modes]
         eigvecs = eigvecs[:, :n_modes]
 
@@ -93,12 +83,9 @@ class ModalSolver3D:
 
             phi /= np.sqrt(m_r)
             eigvecs[:, i] = phi
-
-            m_r_check = float(phi.T @ (self.model.Mff @ phi))
-            modal_masses.append(m_r_check)
+            modal_masses.append(float(phi.T @ (self.model.Mff @ phi)))
 
         modal_masses = np.array(modal_masses, dtype=float)
-
         omegas = np.sqrt(eigvals)
         freqs_hz = omegas / (2.0 * np.pi)
 
@@ -118,3 +105,54 @@ class ModalSolver3D:
     def solve(self, n_modes: int = 6) -> tuple[np.ndarray, np.ndarray]:
         basis = self.solve_basis(n_modes=n_modes)
         return basis.frequencies_hz, basis.modes_full
+
+    def save_basis(self, basis: ModalBasis3D, filepath: str | Path) -> None:
+        path = Path(filepath)
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        np.savez_compressed(
+            path,
+            frequencies_hz=basis.frequencies_hz,
+            omegas_rad_s=basis.omegas_rad_s,
+            eigenvalues=basis.eigenvalues,
+            modes_free=basis.modes_free,
+            modes_full=basis.modes_full,
+            modal_masses=basis.modal_masses,
+        )
+
+        if self.verbose:
+            print(f"Base modale 3D sauvegardée : {path}")
+
+    def load_basis(self, filepath: str | Path) -> ModalBasis3D:
+        path = Path(filepath)
+        if not path.exists():
+            raise FileNotFoundError(f"Base modale introuvable : {path}")
+
+        data = np.load(path)
+
+        basis = ModalBasis3D(
+            frequencies_hz=data["frequencies_hz"],
+            omegas_rad_s=data["omegas_rad_s"],
+            eigenvalues=data["eigenvalues"],
+            modes_free=data["modes_free"],
+            modes_full=data["modes_full"],
+            modal_masses=data["modal_masses"],
+        )
+
+        if self.verbose:
+            print(f"Base modale 3D rechargée : {path}")
+
+        return basis
+
+    def truncate_basis(self, basis: ModalBasis3D, n_modes: int) -> ModalBasis3D:
+        n_available = basis.modes_free.shape[1]
+        n_keep = min(n_modes, n_available)
+
+        return ModalBasis3D(
+            frequencies_hz=basis.frequencies_hz[:n_keep],
+            omegas_rad_s=basis.omegas_rad_s[:n_keep],
+            eigenvalues=basis.eigenvalues[:n_keep],
+            modes_free=basis.modes_free[:, :n_keep],
+            modes_full=basis.modes_full[:, :n_keep],
+            modal_masses=basis.modal_masses[:n_keep],
+        )

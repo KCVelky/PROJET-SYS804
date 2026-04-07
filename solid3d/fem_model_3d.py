@@ -1,6 +1,6 @@
-# solid3d/fem_model_3d.py
-
 from __future__ import annotations
+
+from pathlib import Path
 
 import numpy as np
 from scipy.sparse import csr_matrix
@@ -16,13 +16,6 @@ from solid3d.mesh_data_3d import Mesh3DData
 
 
 class Solid3DFEMModel:
-    """
-    Modèle EF 3D solide :
-    - génération du maillage 3D
-    - assemblage K et M
-    - application des conditions aux limites
-    """
-
     def __init__(
         self,
         plate: Plate,
@@ -85,14 +78,18 @@ class Solid3DFEMModel:
         self.K, self.M = assembler.assemble()
 
     def apply_boundary_conditions(self) -> None:
-        if self.mesh is None or self.K is None or self.M is None:
-            raise RuntimeError("Le maillage et les matrices doivent exister avant les CL.")
+        if self.mesh is None:
+            raise RuntimeError("Le maillage doit exister avant les CL.")
 
         self.constrained_dofs = constrained_dofs_3d(self.plate, self.mesh)
         self.free_dofs = free_dofs_from_constrained_3d(self.n_dofs, self.constrained_dofs)
 
-        self.Kff = self.K[self.free_dofs, :][:, self.free_dofs]
-        self.Mff = self.M[self.free_dofs, :][:, self.free_dofs]
+        if self.K is not None and self.M is not None:
+            self.Kff = self.K[self.free_dofs, :][:, self.free_dofs]
+            self.Mff = self.M[self.free_dofs, :][:, self.free_dofs]
+        else:
+            self.Kff = None
+            self.Mff = None
 
         if self.verbose:
             print("DDL totaux   :", self.n_dofs)
@@ -103,6 +100,55 @@ class Solid3DFEMModel:
         self.build_mesh()
         self.assemble()
         self.apply_boundary_conditions()
+
+    def build_mesh_and_dofs_only(self) -> None:
+        self.build_mesh()
+        self.apply_boundary_conditions()
+
+    def save_dof_partition(self, filepath: str | Path) -> None:
+        if self.constrained_dofs is None or self.free_dofs is None:
+            raise RuntimeError("Les ddl doivent être calculés avant sauvegarde.")
+
+        path = Path(filepath)
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        np.savez_compressed(
+            path,
+            constrained_dofs=self.constrained_dofs,
+            free_dofs=self.free_dofs,
+            n_dofs=np.array([self.n_dofs], dtype=np.int64),
+        )
+
+        if self.verbose:
+            print(f"Partition ddl 3D sauvegardée : {path}")
+
+    def load_dof_partition(self, filepath: str | Path) -> None:
+        if self.mesh is None:
+            raise RuntimeError("Le maillage doit être chargé avant recharge des ddl.")
+
+        path = Path(filepath)
+        if not path.exists():
+            raise FileNotFoundError(f"Partition ddl 3D introuvable : {path}")
+
+        data = np.load(path)
+
+        n_dofs_cached = int(data["n_dofs"][0])
+        if n_dofs_cached != self.n_dofs:
+            raise ValueError(
+                f"Partition ddl incompatible : n_dofs cache={n_dofs_cached}, courant={self.n_dofs}"
+            )
+
+        self.constrained_dofs = data["constrained_dofs"].astype(np.int64, copy=False)
+        self.free_dofs = data["free_dofs"].astype(np.int64, copy=False)
+
+        self.Kff = None
+        self.Mff = None
+
+        if self.verbose:
+            print(f"Partition ddl 3D rechargée : {path}")
+            print("DDL totaux   :", self.n_dofs)
+            print("DDL bloqués  :", len(self.constrained_dofs))
+            print("DDL libres   :", len(self.free_dofs))
 
     def expand_reduced_vector(self, vec_free: np.ndarray) -> np.ndarray:
         if self.free_dofs is None:
