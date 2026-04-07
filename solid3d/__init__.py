@@ -32,3 +32,4 @@ from .probes_3d import (
 )
 from .frf_solver_3d import FRFSolver3D, FRFResult3D
 
+from .modal_frf_solver_3d import ModalFRFSolver3D, ModalFRFResult3D

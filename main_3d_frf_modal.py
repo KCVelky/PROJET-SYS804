@@ -2,8 +2,13 @@ from __future__ import annotations
 
 import matplotlib.pyplot as plt
 
-from solvers import RayleighDamping
-from solid3d import FRFSolver3D, HarmonicPointForce3D, PointSensor3D, Solid3DFEMModel, Solid3DMeshOptions
+from solid3d import (
+    ModalFRFSolver3D,
+    HarmonicPointForce3D,
+    PointSensor3D,
+    Solid3DFEMModel,
+    Solid3DMeshOptions,
+)
 from models import BlackHole, Material, Plate
 
 
@@ -33,17 +38,17 @@ def build_plate() -> Plate:
 
 def build_mesh_options() -> Solid3DMeshOptions:
     return Solid3DMeshOptions(
-    element_order=2,
-    global_size=0.025,
-    local_size=0.010,
-    local_refinement_radius=0.020,
-    transition_thickness=0.010,
-    top_surface_nu=11,
-    top_surface_nv=9,
-    algorithm_3d=10,
-    save_msh_path="outputs/plate_3d_frf_direct.msh",
-    optimize_high_order=False,
-)
+        element_order=2,
+        global_size=0.025,
+        local_size=0.010,
+        local_refinement_radius=0.020,
+        transition_thickness=0.010,
+        top_surface_nu=11,
+        top_surface_nv=9,
+        algorithm_3d=10,
+        save_msh_path="outputs/plate_3d_frf_modal.msh",
+        optimize_high_order=False,
+    )
 
 
 def main() -> None:
@@ -65,7 +70,7 @@ def main() -> None:
         amplitude=1.0,
         frequency_start=80.0,
         frequency_end=300.0,
-        n_points=8,
+        n_points=200,
         phase_deg=0.0,
         direction="z",
     )
@@ -78,30 +83,26 @@ def main() -> None:
         response_type="displacement",
     )
 
-    damping = RayleighDamping.from_modal_damping_ratio(
-        zeta=0.01,
-        freq1_hz=140.0,
-        freq2_hz=500.0,
-    )
-
-    solver = FRFSolver3D(model, verbose=True)
+    solver = ModalFRFSolver3D(model, verbose=True)
     result = solver.solve(
         excitation=excitation,
         sensor=sensor,
-        damping=damping,
+        n_modes=30,
+        damping_ratio=0.01,
     )
 
-    print("=== FRF directe 3D ===")
+    print("=== FRF modale 3D ===")
     print("Noeud excitation :", result.excitation_node_id)
     print("Noeud capteur    :", result.sensor_node_id)
     print("DDL excitation   :", result.excitation_dof_id)
     print("DDL capteur      :", result.sensor_dof_id)
+    print("Modes utilisés   :", result.n_modes_used)
 
     fig, ax = plt.subplots(figsize=(9, 5))
     ax.semilogy(result.frequencies_hz, result.magnitude)
     ax.set_xlabel("Fréquence [Hz]")
     ax.set_ylabel("|H(ω)|")
-    ax.set_title("FRF directe 3D")
+    ax.set_title("FRF modale 3D")
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
     plt.show()
