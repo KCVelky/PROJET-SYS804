@@ -5,6 +5,7 @@ from __future__ import annotations
 import numpy as np
 from scipy.sparse import csr_matrix
 from scipy.sparse.linalg import spsolve
+import time
 
 from fem.fem_model import FEMModel
 from solvers.damping import RayleighDamping
@@ -85,12 +86,24 @@ class HarmonicSolver:
         n_freqs = len(frequencies_hz)
         responses = np.zeros((n_outputs, n_freqs), dtype=complex)
 
+        t_global = time.perf_counter()
+
         for i, freq_hz in enumerate(frequencies_hz):
-            if i % 10 == 0 or i == len(frequencies_hz) - 1:
-                print(f"FRF en cours : {i+1}/{len(frequencies_hz)} fréquences | f = {freq_hz:.2f} Hz")
+            t0 = time.perf_counter()
 
             omega = 2.0 * np.pi * freq_hz
             dynamic_stiffness = Kff + 1j * omega * Cff - (omega ** 2) * Mff
             q_free = spsolve(dynamic_stiffness, force_vector_free)
             responses[:, i] = q_free[output_dofs_free]
+
+            dt = time.perf_counter() - t0
+            dt_total = time.perf_counter() - t_global
+
+            print(
+                f"FRF en cours : {i+1}/{len(frequencies_hz)} | "
+                f"f = {freq_hz:.2f} Hz | "
+                f"temps point = {dt:.2f} s | "
+                f"cumul = {dt_total/60.0:.2f} min",
+                flush=True,
+            )
         return responses

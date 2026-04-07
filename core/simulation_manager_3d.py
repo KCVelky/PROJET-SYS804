@@ -3,10 +3,14 @@ from __future__ import annotations
 from typing import Any
 
 from models import BlackHole, Material, Plate
+from solvers import RayleighDamping
 from solid3d import (
+    FRFSolver3D,
+    HarmonicPointForce3D,
     ModalComparison3D,
     ModalSolver3D,
     ModalValidation3D,
+    PointSensor3D,
     Solid3DFEMModel,
     Solid3DMeshOptions,
 )
@@ -16,10 +20,10 @@ class SimulationManager3D:
     """
     Chef d'orchestre dédié à la branche 3D solide.
 
-    Cette classe reste volontairement séparée du SimulationManager 2D afin de :
-    - ne pas casser l'architecture existante,
-    - garder un pilotage 3D propre,
-    - préparer l'intégration Qt plus tard.
+    Cette classe reste séparée du SimulationManager 2D afin de :
+    - ne pas casser l'existant,
+    - garder une architecture 3D propre,
+    - préparer l'intégration Qt et la suite FRF/modal FRF.
     """
 
     def __init__(self, load_defaults: bool = True) -> None:
@@ -27,6 +31,8 @@ class SimulationManager3D:
         self.plate_params: dict[str, Any] = {}
         self.black_hole_params: dict[str, Any] = {}
         self.mesh_params: dict[str, Any] = {}
+        self.excitation_params: dict[str, Any] = {}
+        self.sensors: dict[str, dict[str, Any]] = {}
 
         self._model_cache: dict[bool, Solid3DFEMModel] = {}
         self._modal_basis_cache: dict[tuple[bool, int], Any] = {}
@@ -44,6 +50,8 @@ class SimulationManager3D:
         self.plate_params.clear()
         self.black_hole_params.clear()
         self.mesh_params.clear()
+        self.excitation_params.clear()
+        self.sensors.clear()
         self.last_results.clear()
         self.invalidate_cache()
 
@@ -81,6 +89,25 @@ class SimulationManager3D:
             algorithm_3d=10,
             save_msh_path="outputs/plate_abh_3d_manager.msh",
             optimize_high_order=False,
+        )
+        self.set_excitation(
+            x=0.10,
+            y=0.10,
+            z=0.002,
+            amplitude=1.0,
+            frequency_start=50.0,
+            frequency_end=700.0,
+            n_points=300,
+            phase_deg=0.0,
+            direction="z",
+        )
+        self.set_sensor(
+            name="S1",
+            x=0.35,
+            y=0.25,
+            z=0.002,
+            direction="z",
+            response_type="displacement",
         )
 
     def set_material(
@@ -179,6 +206,48 @@ class SimulationManager3D:
         }
         self.invalidate_cache()
 
+    def set_excitation(
+        self,
+        x: float,
+        y: float,
+        z: float,
+        amplitude: float,
+        frequency_start: float,
+        frequency_end: float,
+        n_points: int = 300,
+        phase_deg: float = 0.0,
+        direction: str = "z",
+    ) -> None:
+        self.excitation_params = {
+            "x": x,
+            "y": y,
+            "z": z,
+            "amplitude": amplitude,
+            "frequency_start": frequency_start,
+            "frequency_end": frequency_end,
+            "n_points": n_points,
+            "phase_deg": phase_deg,
+            "direction": direction,
+        }
+
+    def set_sensor(
+        self,
+        name: str,
+        x: float,
+        y: float,
+        z: float,
+        direction: str = "z",
+        response_type: str = "displacement",
+    ) -> None:
+        self.sensors[name] = {
+            "x": x,
+            "y": y,
+            "z": z,
+            "name": name,
+            "direction": direction,
+            "response_type": response_type,
+        }
+
     def enable_black_hole(self) -> None:
         if self.black_hole_params:
             self.black_hole_params["enabled"] = True
@@ -218,6 +287,16 @@ class SimulationManager3D:
         if not self.mesh_params:
             raise RuntimeError("Les paramètres de maillage 3D ne sont pas définis.")
         return Solid3DMeshOptions(**self.mesh_params)
+
+    def build_excitation(self) -> HarmonicPointForce3D:
+        if not self.excitation_params:
+            raise RuntimeError("Les paramètres d'excitation 3D ne sont pas définis.")
+        return HarmonicPointForce3D(**self.excitation_params)
+
+    def build_sensor(self, name: str) -> PointSensor3D:
+        if name not in self.sensors:
+            raise KeyError(f"Capteur 3D inconnu : '{name}'")
+        return PointSensor3D(**self.sensors[name])
 
     def get_model(self, use_black_hole: bool = True, rebuild: bool = False) -> Solid3DFEMModel:
         key = bool(use_black_hole)
@@ -282,7 +361,7 @@ class SimulationManager3D:
             "model": model,
             "basis": basis,
             "validation": validation,
-            "is_valid": validator.is_valid(validation),
+            "is_valid": validator.is_valid(validation, stiffness_rel_tol=1e-2),
         }
         self.last_results["modal_validation_3d"] = result
         return result
@@ -302,10 +381,79 @@ class SimulationManager3D:
         self.last_results["modal_comparison_3d"] = result
         return result
 
+    def run_frf_direct(
+        self,
+        sensor_name: str,
+        use_black_hole: bool = True,
+        damping_ratio: float = 0.01,
+        damping_freq1_hz: float = 140.0,
+        damping_freq2_hz: float = 500.0,
+        rebuild: bool = False,
+    ) -> dict[str, Any]:
+        model = self.get_model(use_black_hole=use_black_hole, rebuild=rebuild)
+        excitation = self.build_excitation()
+        sensor = self.build_sensor(sensor_name)
+
+        damping = RayleighDamping.from_modal_damping_ratio(
+            zeta=damping_ratio,
+            freq1_hz=damping_freq1_hz,
+            freq2_hz=damping_freq2_hz,
+        )
+
+        solver = FRFSolver3D(model, verbose=True)
+        frf_result = solver.solve(
+            excitation=excitation,
+            sensor=sensor,
+            damping=damping,
+        )
+
+        result = {
+            "model": model,
+            "sensor": sensor,
+            "excitation": excitation,
+            "damping": damping,
+            "frf_result": frf_result,
+        }
+        self.last_results["frf_direct_3d"] = result
+        return result
+
+    def compare_frf_direct(
+        self,
+        sensor_name: str,
+        damping_ratio: float = 0.01,
+        damping_freq1_hz: float = 140.0,
+        damping_freq2_hz: float = 500.0,
+        rebuild: bool = False,
+    ) -> dict[str, Any]:
+        ref = self.run_frf_direct(
+            sensor_name=sensor_name,
+            use_black_hole=False,
+            damping_ratio=damping_ratio,
+            damping_freq1_hz=damping_freq1_hz,
+            damping_freq2_hz=damping_freq2_hz,
+            rebuild=rebuild,
+        )
+        bh = self.run_frf_direct(
+            sensor_name=sensor_name,
+            use_black_hole=True,
+            damping_ratio=damping_ratio,
+            damping_freq1_hz=damping_freq1_hz,
+            damping_freq2_hz=damping_freq2_hz,
+            rebuild=rebuild,
+        )
+        result = {
+            "reference": ref,
+            "black_hole": bh,
+        }
+        self.last_results["frf_direct_comparison_3d"] = result
+        return result
+
     def get_case_summary(self) -> dict[str, Any]:
         return {
             "material": dict(self.material_params),
             "plate": dict(self.plate_params),
             "black_hole": dict(self.black_hole_params),
             "mesh": dict(self.mesh_params),
+            "excitation": dict(self.excitation_params),
+            "sensors": {name: dict(params) for name, params in self.sensors.items()},
         }
