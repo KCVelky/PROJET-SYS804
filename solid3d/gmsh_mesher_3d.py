@@ -71,7 +71,10 @@ class GmshABH3DMesher:
     tronquée par le contour rectangulaire supérieur.
     """
     def _optimize_high_order_mesh(self, options: Solid3DMeshOptions) -> None:
-        import gmsh
+        try:
+            import gmsh
+        except ImportError as exc:
+            raise ImportError("Le module gmsh n'est pas installé. Installe-le avant d'utiliser la branche 3D.") from exc
 
         if options.element_order <= 1:
             return
@@ -136,7 +139,10 @@ class GmshABH3DMesher:
         - 4 faces latérales planes
         - volume fermé
         """
-        import gmsh
+        try:
+            import gmsh
+        except ImportError as exc:
+            raise ImportError("Le module gmsh n'est pas installé. Installe-le avant d'utiliser la branche 3D.") from exc
 
         occ = gmsh.model.occ
 
@@ -288,7 +294,10 @@ class GmshABH3DMesher:
         """
         Définit la stratégie de taille de maille.
         """
-        import gmsh
+        try:
+            import gmsh
+        except ImportError as exc:
+            raise ImportError("Le module gmsh n'est pas installé. Installe-le avant d'utiliser la branche 3D.") from exc
 
         gmsh.option.setNumber("General.Terminal", 1)
 
@@ -330,7 +339,10 @@ class GmshABH3DMesher:
         Extrait tous les blocs tétraédriques volumiques pertinents
         et compacte les nœuds réellement utilisés.
         """
-        import gmsh
+        try:
+            import gmsh
+        except ImportError as exc:
+            raise ImportError("Le module gmsh n'est pas installé. Installe-le avant d'utiliser la branche 3D.") from exc
         import numpy as np
 
         # Tous les nœuds du maillage Gmsh
@@ -424,7 +436,10 @@ class GmshABH3DMesher:
     # ------------------------------------------------------------------
 
     def generate(self, options: Solid3DMeshOptions) -> Mesh3DData:
-        import gmsh
+        try:
+            import gmsh
+        except ImportError as exc:
+            raise ImportError("Le module gmsh n'est pas installé. Installe-le avant d'utiliser la branche 3D.") from exc
 
         msh_path = Path(options.save_msh_path) if options.save_msh_path else None
 

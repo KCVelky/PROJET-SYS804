@@ -1,5 +1,3 @@
-# solid3d/assembler_3d.py
-
 from __future__ import annotations
 
 import numpy as np
@@ -11,16 +9,8 @@ from solid3d.tet10_element import LinearElasticTet10Element
 
 
 class Solid3DAssembler:
-    """
-    Assembleur global 3D solide.
-    """
+    """Assembleur global 3D solide optimisé pour Tetra10."""
 
-    # permutation locale qui inverse l'orientation en échangeant
-    # les sommets 3 et 4, avec les nœuds d'arêtes remis dans le bon ordre
-    # ordre local supposé :
-    # [1,2,3,4,12,23,31,14,24,34]
-    # après swap(3,4) :
-    # [1,2,4,3,12,24,41,13,23,43]
     _PERM_SWAP_34 = np.array([0, 1, 3, 2, 4, 8, 7, 6, 5, 9], dtype=np.int64)
 
     def __init__(self, plate: Plate, mesh: Mesh3DData, verbose: bool = True) -> None:
@@ -41,42 +31,24 @@ class Solid3DAssembler:
 
     @staticmethod
     def element_dof_map(node_ids: np.ndarray) -> np.ndarray:
-        dofs = np.empty(3 * len(node_ids), dtype=np.int64)
-        for i, nid in enumerate(node_ids):
-            base = 3 * i
-            dofs[base + 0] = 3 * nid + 0
-            dofs[base + 1] = 3 * nid + 1
-            dofs[base + 2] = 3 * nid + 2
-        return dofs
+        node_ids = np.asarray(node_ids, dtype=np.int64)
+        return (3 * node_ids[:, None] + np.array([0, 1, 2], dtype=np.int64)).ravel()
 
     @staticmethod
     def _corner_signed_jacobian(node_coords: np.ndarray) -> float:
-        """
-        Jacobien signé du tétra linéaire défini par les 4 coins.
-        """
-        x1 = node_coords[0]
-        x2 = node_coords[1]
-        x3 = node_coords[2]
-        x4 = node_coords[3]
-
+        x1, x2, x3, x4 = node_coords[:4]
         J = np.column_stack([x2 - x1, x3 - x1, x4 - x1])
         return float(np.linalg.det(J))
 
     def _canonicalize_tet10_connectivity(self, elem: np.ndarray) -> np.ndarray:
-        """
-        Corrige l'orientation locale si nécessaire.
-        """
         coords = self.mesh.points[elem, :]
         det_corner = self._corner_signed_jacobian(coords)
-
         if det_corner > 0.0:
             return elem
 
-        # on tente la permutation locale de retournement
         elem2 = elem[self._PERM_SWAP_34]
         coords2 = self.mesh.points[elem2, :]
         det_corner2 = self._corner_signed_jacobian(coords2)
-
         if det_corner2 > 0.0:
             return elem2
 
@@ -97,16 +69,19 @@ class Solid3DAssembler:
             print("Nombre d'éléments  :", n_elems)
 
         tri_r, tri_c = np.triu_indices(30)
-        I_blocks = []
-        J_blocks = []
-        KV_blocks = []
-        MV_blocks = []
+        n_terms = tri_r.size
+        total_terms = n_elems * n_terms
+
+        I = np.empty(total_terms, dtype=np.int32)
+        J = np.empty(total_terms, dtype=np.int32)
+        VK = np.empty(total_terms, dtype=float)
+        VM = np.empty(total_terms, dtype=float)
 
         progress_step = max(1, n_elems // 20)
 
         for e, elem_raw in enumerate(self.mesh.cells):
             elem = self._canonicalize_tet10_connectivity(elem_raw)
-            coords = self.mesh.points[elem, :]  # (10,3)
+            coords = self.mesh.points[elem, :]
 
             try:
                 Ke, Me = self.element.stiffness_and_mass(coords)
@@ -118,24 +93,18 @@ class Solid3DAssembler:
                 ) from exc
 
             dofs = self.element_dof_map(elem)
-
-            I_blocks.append(dofs[tri_r].astype(np.int32))
-            J_blocks.append(dofs[tri_c].astype(np.int32))
-            KV_blocks.append(Ke[tri_r, tri_c])
-            MV_blocks.append(Me[tri_r, tri_c])
+            sl = slice(e * n_terms, (e + 1) * n_terms)
+            I[sl] = dofs[tri_r]
+            J[sl] = dofs[tri_c]
+            VK[sl] = Ke[tri_r, tri_c]
+            VM[sl] = Me[tri_r, tri_c]
 
             if self.verbose and ((e + 1) % progress_step == 0 or e == n_elems - 1):
                 print(f"Assemblage : {e+1}/{n_elems} éléments")
-
-        I = np.concatenate(I_blocks)
-        J = np.concatenate(J_blocks)
-        VK = np.concatenate(KV_blocks)
-        VM = np.concatenate(MV_blocks)
 
         K_upper = coo_matrix((VK, (I, J)), shape=(n_dofs, n_dofs)).tocsr()
         M_upper = coo_matrix((VM, (I, J)), shape=(n_dofs, n_dofs)).tocsr()
 
         K = K_upper + K_upper.T - diags(K_upper.diagonal())
         M = M_upper + M_upper.T - diags(M_upper.diagonal())
-
         return K.tocsr(), M.tocsr()

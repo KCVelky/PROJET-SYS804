@@ -33,3 +33,11 @@ from .probes_3d import (
 from .frf_solver_3d import FRFSolver3D, FRFResult3D
 
 from .modal_frf_solver_3d import ModalFRFSolver3D, ModalFRFResult3D
+
+from .cache_utils_3d import (
+    short_cache_name,
+    build_mesh_cache_filename,
+    build_dofs_cache_filename,
+    build_basis_cache_filename,
+    build_frf_cache_filename,
+)

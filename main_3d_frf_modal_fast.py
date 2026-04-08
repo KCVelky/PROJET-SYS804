@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -14,6 +13,10 @@ from solid3d import (
     PointSensor3D,
     Solid3DFEMModel,
     Solid3DMeshOptions,
+    build_basis_cache_filename,
+    build_dofs_cache_filename,
+    build_frf_cache_filename,
+    build_mesh_cache_filename,
 )
 
 RECOMPUTE_MESH = False
@@ -24,14 +27,8 @@ N_MODES_USED = 60
 N_MODES_CACHE = 100
 
 
-def short_cache_name(prefix: str, payload: str, ext: str) -> str:
-    digest = hashlib.sha1(payload.encode("utf-8")).hexdigest()[:16]
-    return f"{prefix}_{digest}.{ext}"
-
-
 def build_plate() -> Plate:
     material = Material.aluminum()
-
     black_hole = BlackHole(
         xc=0.25,
         yc=0.20,
@@ -41,7 +38,6 @@ def build_plate() -> Plate:
         exponent=2.0,
         enabled=True,
     )
-
     plate = Plate(
         length_x=0.50,
         length_y=0.40,
@@ -65,112 +61,16 @@ def build_mesh_options() -> Solid3DMeshOptions:
         top_surface_nu=13,
         top_surface_nv=11,
         algorithm_3d=10,
-        save_msh_path="outputs/plate_3d_frf_modal_fast.msh",
+        save_msh_path="outputs",
         reuse_saved_msh=not RECOMPUTE_MESH,
         optimize_high_order=False,
     )
 
 
-def build_mesh_filename(
-    plate: Plate,
-    mesh_options: Solid3DMeshOptions,
-    use_black_hole: bool,
-) -> str:
-    bh = plate.black_hole
-    payload = [
-        f"bc={plate.boundary_condition}",
-        f"eo={mesh_options.element_order}",
-        f"gs={mesh_options.global_size}",
-        f"ls={mesh_options.local_size}",
-        f"rr={mesh_options.local_refinement_radius}",
-        f"tt={mesh_options.transition_thickness}",
-        f"nu={mesh_options.top_surface_nu}",
-        f"nv={mesh_options.top_surface_nv}",
-        f"alg={mesh_options.algorithm_3d}",
-        f"use_bh={use_black_hole}",
-    ]
-
-    if use_black_hole and bh is not None and bh.enabled:
-        payload += [
-            f"xc={bh.xc}",
-            f"yc={bh.yc}",
-            f"r={bh.radius}",
-            f"rt={bh.truncation_radius}",
-            f"hr={bh.residual_thickness}",
-            f"m={bh.exponent}",
-        ]
-
-    return short_cache_name("mesh3d", "|".join(payload), "msh")
-
-
-def build_basis_filename(
-    plate: Plate,
-    mesh_options: Solid3DMeshOptions,
-    n_modes: int,
-    use_black_hole: bool,
-    mesh_filename: str,
-) -> str:
-    bh = plate.black_hole
-    payload = [
-        f"mesh={Path(mesh_filename).stem}",
-        f"bc={plate.boundary_condition}",
-        f"nm={n_modes}",
-        f"use_bh={use_black_hole}",
-        f"eo={mesh_options.element_order}",
-    ]
-
-    if use_black_hole and bh is not None and bh.enabled:
-        payload += [
-            f"r={bh.radius}",
-            f"rt={bh.truncation_radius}",
-            f"hr={bh.residual_thickness}",
-            f"m={bh.exponent}",
-        ]
-
-    return short_cache_name("modal_basis_3d", "|".join(payload), "npz")
-
-
-def build_dofs_filename(mesh_filename: str, plate: Plate) -> str:
-    payload = f"mesh={Path(mesh_filename).stem}|bc={plate.boundary_condition}"
-    return short_cache_name("dofs3d", payload, "npz")
-
-
-def build_frf_filename(
-    mesh_filename: str,
-    plate: Plate,
-    excitation: HarmonicPointForce3D,
-    sensor: PointSensor3D,
-    damping: RayleighDamping,
-    n_modes_used: int,
-) -> str:
-    payload = [
-        f"mesh={Path(mesh_filename).stem}",
-        f"bc={plate.boundary_condition}",
-        f"nm={n_modes_used}",
-        f"fx={excitation.x}",
-        f"fy={excitation.y}",
-        f"fz={excitation.z}",
-        f"fdir={excitation.direction}",
-        f"amp={excitation.amplitude}",
-        f"fstart={excitation.frequency_start}",
-        f"fend={excitation.frequency_end}",
-        f"np={excitation.n_points}",
-        f"sx={sensor.x}",
-        f"sy={sensor.y}",
-        f"sz={sensor.z}",
-        f"sdir={sensor.direction}",
-        f"rtype={sensor.response_type}",
-        f"ra={damping.alpha}",
-        f"rb={damping.beta}",
-    ]
-    return short_cache_name("frf3d_modal", "|".join(payload), "npz")
-
-
 def save_frf_result(filepath: str | Path, result) -> None:
     path = Path(filepath)
     path.parent.mkdir(parents=True, exist_ok=True)
-
-    np.savez_compressed(
+    np.savez(
         path,
         frequencies_hz=result.frequencies_hz,
         response_complex=result.response_complex,
@@ -197,73 +97,37 @@ def load_frf_arrays(filepath: str | Path) -> tuple[np.ndarray, np.ndarray]:
 def main() -> None:
     plate = build_plate()
     mesh_options = build_mesh_options()
-
-    n_modes = N_MODES_USED
-    n_modes_cache = max(N_MODES_CACHE, n_modes)
     use_black_hole = True
 
-    mesh_filename = build_mesh_filename(
-        plate=plate,
-        mesh_options=mesh_options,
-        use_black_hole=use_black_hole,
-    )
+    mesh_filename = build_mesh_cache_filename(plate=plate, mesh_options=mesh_options, use_black_hole=use_black_hole)
     mesh_options.save_msh_path = str(Path("outputs") / mesh_filename)
 
-    model = Solid3DFEMModel(
-        plate=plate,
-        mesh_options=mesh_options,
-        use_black_hole=use_black_hole,
-        verbose=True,
-    )
+    model = Solid3DFEMModel(plate=plate, mesh_options=mesh_options, use_black_hole=use_black_hole, verbose=True)
 
     excitation = HarmonicPointForce3D(
-        x=0.10,
-        y=0.10,
-        z=0.002,
-        amplitude=1.0,
-        frequency_start=80.0,
-        frequency_end=300.0,
-        n_points=1000,
-        phase_deg=0.0,
-        direction="z",
+        x=0.10, y=0.10, z=0.002, amplitude=1.0,
+        frequency_start=80.0, frequency_end=300.0, n_points=1000,
+        phase_deg=0.0, direction="z",
     )
+    sensor = PointSensor3D(x=0.35, y=0.25, z=0.002, name="S1", direction="z", response_type="displacement")
+    damping = RayleighDamping.from_modal_damping_ratio(zeta=0.01, freq1_hz=100.0, freq2_hz=250.0)
 
-    sensor = PointSensor3D(
-        x=0.35,
-        y=0.25,
-        z=0.002,
-        name="S1",
-        direction="z",
-        response_type="displacement",
-    )
-
-    damping = RayleighDamping.from_modal_damping_ratio(
-        zeta=0.01,
-        freq1_hz=100.0,
-        freq2_hz=250.0,
-    )
-
-    basis_filename = build_basis_filename(
+    basis_path = Path("outputs") / build_basis_cache_filename(
         plate=plate,
-        mesh_options=mesh_options,
-        n_modes=n_modes_cache,
+        mesh_filename=mesh_filename,
+        n_modes=max(N_MODES_CACHE, N_MODES_USED),
         use_black_hole=use_black_hole,
-        mesh_filename=mesh_filename,
+        storage="compact",
     )
-    basis_path = Path("outputs") / basis_filename
-
-    dofs_filename = build_dofs_filename(mesh_filename=mesh_filename, plate=plate)
-    dofs_path = Path("outputs") / dofs_filename
-
-    frf_filename = build_frf_filename(
-        mesh_filename=mesh_filename,
+    dofs_path = Path("outputs") / build_dofs_cache_filename(mesh_filename=mesh_filename, plate=plate)
+    frf_path = Path("outputs") / build_frf_cache_filename(
         plate=plate,
+        mesh_filename=mesh_filename,
         excitation=excitation,
         sensor=sensor,
         damping=damping,
-        n_modes_used=n_modes,
+        n_modes_used=N_MODES_USED,
     )
-    frf_path = Path("outputs") / frf_filename
 
     basis_cached = basis_path.exists() and not RECOMPUTE_BASIS
     dofs_cached = dofs_path.exists()
@@ -283,34 +147,26 @@ def main() -> None:
     if basis_cached:
         cached_basis = solver.modal_solver.load_basis(basis_path)
         n_cached = cached_basis.modes_free.shape[1]
-
-        if n_cached >= n_modes:
-            modal_basis = solver.modal_solver.truncate_basis(cached_basis, n_modes)
+        if n_cached >= N_MODES_USED:
+            modal_basis = solver.modal_solver.truncate_basis(cached_basis, N_MODES_USED)
         else:
-            modal_basis = solver.modal_solver.solve_basis(n_modes=n_modes_cache)
-            solver.modal_solver.save_basis(modal_basis, basis_path)
-            modal_basis = solver.modal_solver.truncate_basis(modal_basis, n_modes)
+            modal_basis = solver.modal_solver.solve_basis(n_modes=max(N_MODES_CACHE, N_MODES_USED), build_full_modes=False)
+            solver.modal_solver.save_basis(modal_basis, basis_path, store_full_modes=False, compressed=False, dtype=np.float32)
+            modal_basis = solver.modal_solver.truncate_basis(modal_basis, N_MODES_USED)
     else:
-        modal_basis = solver.modal_solver.solve_basis(n_modes=n_modes_cache)
-        solver.modal_solver.save_basis(modal_basis, basis_path)
-        modal_basis = solver.modal_solver.truncate_basis(modal_basis, n_modes)
+        modal_basis = solver.modal_solver.solve_basis(n_modes=max(N_MODES_CACHE, N_MODES_USED), build_full_modes=False)
+        solver.modal_solver.save_basis(modal_basis, basis_path, store_full_modes=False, compressed=False, dtype=np.float32)
+        modal_basis = solver.modal_solver.truncate_basis(modal_basis, N_MODES_USED)
 
     if frf_path.exists() and not RECOMPUTE_FRF:
         frequencies_hz, frf_complex = load_frf_arrays(frf_path)
     else:
-        result = solver.solve(
-            excitation=excitation,
-            sensor=sensor,
-            n_modes=n_modes,
-            damping=damping,
-            modal_basis=modal_basis,
-        )
+        result = solver.solve(excitation=excitation, sensor=sensor, n_modes=N_MODES_USED, damping=damping, modal_basis=modal_basis)
         save_frf_result(frf_path, result)
         frequencies_hz = result.frequencies_hz
         frf_complex = result.frf_complex
 
     magnitude = np.abs(frf_complex)
-
     fig, ax = plt.subplots(figsize=(9, 5))
     ax.semilogy(frequencies_hz, magnitude, linewidth=2)
     ax.set_xlabel("Fréquence [Hz]")
