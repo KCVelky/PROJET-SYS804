@@ -161,7 +161,7 @@ class Viewer3D(QWidget):
             to_plot = dataset
             if "disp" in dataset.point_data:
                 to_plot = dataset.warp_by_vector("disp", factor=1.0)
-            surface = to_plot.extract_surface()
+            surface = to_plot.extract_surface(algorithm="dataset_surface")
             self.plotter.add_mesh(surface, scalars=scalars_name, show_edges=show_edges)
             self.plotter.add_axes()
             self.plotter.reset_camera()

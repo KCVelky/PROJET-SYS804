@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import numpy as np
+
 from models import BlackHole, Material, Plate
 from solvers import RayleighDamping
 from solid3d import (
@@ -9,6 +11,7 @@ from solid3d import (
     HarmonicPointForce3D,
     ModalComparison3D,
     ModalSolver3D,
+    ModalFRFSolver3D,
     ModalValidation3D,
     PointSensor3D,
     Solid3DFEMModel,
@@ -447,6 +450,355 @@ class SimulationManager3D:
         }
         self.last_results["frf_direct_comparison_3d"] = result
         return result
+    
+    # ============================================================
+    # Bridge UI 3D <-> backend existant
+    # ============================================================
+
+    def _ui_use_black_hole(self, params: dict[str, Any]) -> bool:
+        return str(params.get("case", "vbh")).lower() != "uniform"
+
+    def _apply_ui_params(self, params: dict[str, Any]) -> None:
+        """
+        Traduit les paramètres venant de l'UI 3D vers l'API backend existante.
+        """
+        plate = params.get("plate", {})
+        material = params.get("material", {})
+        vbh = params.get("vbh", {})
+        mesh = params.get("mesh", {})
+        frf = params.get("frf", {})
+
+        use_black_hole = self._ui_use_black_hole(params)
+
+        # -------------------------
+        # Material
+        # -------------------------
+        self.set_material(
+            young_modulus=float(material.get("E", 69e9)),
+            poisson_ratio=float(material.get("nu", 0.33)),
+            density=float(material.get("rho", 2700.0)),
+            name="UI Material",
+        )
+
+        # -------------------------
+        # Plate
+        # -------------------------
+        h0 = float(plate.get("h0", 0.002))
+        self.set_plate(
+            length_x=float(plate.get("lx", 0.50)),
+            length_y=float(plate.get("ly", 0.40)),
+            thickness=h0,
+            boundary_condition="clamped",
+            name="Plaque 3D UI",
+        )
+
+        # -------------------------
+        # Black hole
+        # -------------------------
+        radius = float(vbh.get("radius", 0.06))
+        truncation_radius = float(
+            vbh.get(
+                "truncation_radius",
+                max(1e-4, min(0.005, 0.25 * radius))
+            )
+        )
+
+        self.set_black_hole(
+            xc=float(vbh.get("cx", 0.25)),
+            yc=float(vbh.get("cy", 0.20)),
+            radius=radius,
+            truncation_radius=truncation_radius,
+            residual_thickness=float(vbh.get("h_residual", 0.0003)),
+            exponent=float(vbh.get("m", 2.0)),
+            enabled=use_black_hole,
+        )
+
+        # -------------------------
+        # Mesh
+        # -------------------------
+        h_global = float(mesh.get("h_global", 0.012))
+        h_local = float(mesh.get("h_local", 0.004))
+        refine_vbh = bool(mesh.get("refine_vbh", True))
+
+        local_ref_radius = 0.60 * radius if refine_vbh else max(radius, h_global)
+
+        self.set_mesh(
+            element_order=int(mesh.get("order", 2)),
+            global_size=h_global,
+            local_size=h_local,
+            local_refinement_radius=max(1e-4, local_ref_radius),
+            transition_thickness=max(1e-4, 0.20 * radius),
+            top_surface_nu=17,
+            top_surface_nv=13,
+            algorithm_3d=10,
+            save_msh_path="outputs/ui_3d_generated.msh",
+            optimize_high_order=False,
+        )
+
+        # -------------------------
+        # Excitation
+        # -------------------------
+        excitation = frf.get("excitation", [0.10, 0.10, h0])
+        response = frf.get("response", [0.30, 0.20, h0])
+
+        ex = float(excitation[0]) if len(excitation) > 0 else 0.10
+        ey = float(excitation[1]) if len(excitation) > 1 else 0.10
+        ez = float(excitation[2]) if len(excitation) > 2 else h0
+
+        rx = float(response[0]) if len(response) > 0 else 0.30
+        ry = float(response[1]) if len(response) > 1 else 0.20
+        rz = float(response[2]) if len(response) > 2 else h0
+
+        fmin = float(frf.get("fmin", 1.0))
+        fmax = float(frf.get("fmax", 1000.0))
+        n_freq = int(frf.get("n_freq", 400))
+        direction = str(frf.get("direction", "uz")).lower().replace("u", "")
+
+        self.set_excitation(
+            x=ex,
+            y=ey,
+            z=ez,
+            amplitude=1.0,
+            frequency_start=fmin,
+            frequency_end=fmax,
+            n_points=n_freq,
+            phase_deg=0.0,
+            direction=direction,
+        )
+
+        self.set_sensor(
+            name="UI_SENSOR",
+            x=rx,
+            y=ry,
+            z=rz,
+            direction=direction,
+            response_type="displacement",
+        )
+
+    def _build_mesh_stats(
+        self,
+        model: Solid3DFEMModel,
+        mesh: Any,
+        use_black_hole: bool,
+    ) -> dict[str, Any]:
+        stats: dict[str, Any] = {
+            "use_black_hole": use_black_hole,
+            "element_order": self.mesh_params.get("element_order"),
+            "global_size": self.mesh_params.get("global_size"),
+            "local_size": self.mesh_params.get("local_size"),
+        }
+
+        if hasattr(mesh, "n_points"):
+            stats["n_points"] = int(mesh.n_points)
+        if hasattr(mesh, "n_cells"):
+            stats["n_cells"] = int(mesh.n_cells)
+        if hasattr(mesh, "bounds"):
+            stats["bounds"] = tuple(float(v) for v in mesh.bounds)
+
+        for attr_name in [
+            "n_dofs_total",
+            "n_total_dofs",
+            "n_dofs",
+            "n_free_dofs",
+            "n_blocked_dofs",
+        ]:
+            if hasattr(model, attr_name):
+                value = getattr(model, attr_name)
+                if isinstance(value, (int, float)):
+                    stats[attr_name] = int(value)
+
+        return stats
+
+    def preview_mesh(self, params: dict[str, Any]) -> dict[str, Any]:
+        """
+        Méthode attendue par l'UI 3D.
+        Prépare et retourne le maillage sans logique supplémentaire côté UI.
+        """
+        self._apply_ui_params(params)
+        use_black_hole = self._ui_use_black_hole(params)
+
+        model = self.get_model(use_black_hole=use_black_hole, rebuild=True)
+        mesh = model.mesh
+
+        return {
+            "model": model,
+            "mesh": mesh,
+            "grid": mesh,
+            "stats": self._build_mesh_stats(model, mesh, use_black_hole),
+        }
+
+    def generate_mesh(self, params: dict[str, Any]) -> dict[str, Any]:
+        """
+        Même logique que preview_mesh, mais nom explicite pour le bouton UI.
+        """
+        self._apply_ui_params(params)
+        use_black_hole = self._ui_use_black_hole(params)
+
+        model = self.get_model(use_black_hole=use_black_hole, rebuild=True)
+        mesh = model.mesh
+
+        return {
+            "model": model,
+            "mesh": mesh,
+            "grid": mesh,
+            "stats": self._build_mesh_stats(model, mesh, use_black_hole),
+        }
+
+    def solve_modal(self, params: dict[str, Any]) -> dict[str, Any]:
+        """
+        Méthode attendue par l'UI 3D.
+        """
+        self._apply_ui_params(params)
+        use_black_hole = self._ui_use_black_hole(params)
+
+        modal_params = params.get("modal", {})
+        n_modes = int(modal_params.get("n_modes", 6))
+
+        raw = self.run_modal_analysis(
+            n_modes=n_modes,
+            use_black_hole=use_black_hole,
+            rebuild=True,
+        )
+
+        freqs = raw.get("frequencies_hz", [])
+        if hasattr(freqs, "tolist"):
+            freqs = freqs.tolist()
+
+        return {
+            "model": raw["model"],
+            "modal_result": raw,
+            "freqs": freqs,
+            "frequencies": freqs,
+            "modes_full": raw.get("modes_full"),
+            "modes_free": raw.get("modes_free"),
+            "eigenvalues": raw.get("eigenvalues"),
+        }
+
+    def get_mode_shape(
+        self,
+        modal_result: dict[str, Any],
+        mode_index: int,
+        component: str = "norm",
+        scale: float = 1.0,
+    ) -> dict[str, Any]:
+        """
+        Retourne un mesh déformé + champ scalaire pour affichage PyVista.
+        """
+        raw = modal_result.get("modal_result", modal_result)
+        model = raw["model"]
+        mesh = model.mesh
+
+        if not hasattr(mesh, "copy"):
+            raise RuntimeError("Le mesh 3D ne supporte pas la copie pour l'affichage modal.")
+
+        grid = mesh.copy(deep=True)
+
+        modes_full = raw.get("modes_full", None)
+        if modes_full is None:
+            raise RuntimeError("Aucun mode complet disponible dans le résultat modal.")
+
+        vec = np.asarray(modes_full[:, mode_index]).reshape(-1)
+
+        n_points = getattr(grid, "n_points", None)
+        if n_points is None:
+            raise RuntimeError("Impossible de déterminer le nombre de nœuds du mesh.")
+
+        if vec.size < 3 * n_points:
+            # Fallback si le vecteur n'est pas structuré comme 3 ddl par nœud
+            scalars = np.abs(vec[:n_points])
+            grid.point_data["mode_shape"] = scalars
+            return {
+                "mesh": grid,
+                "grid": grid,
+                "scalars_name": "mode_shape",
+            }
+
+        disp = vec[: 3 * n_points].reshape(n_points, 3)
+
+        comp = str(component).lower()
+        if comp == "ux":
+            scalars = disp[:, 0]
+        elif comp == "uy":
+            scalars = disp[:, 1]
+        elif comp == "uz":
+            scalars = disp[:, 2]
+        else:
+            scalars = np.linalg.norm(disp, axis=1)
+
+        if hasattr(grid, "points"):
+            grid.points = np.asarray(grid.points).copy() + float(scale) * disp
+
+        grid.point_data["mode_shape"] = scalars
+        grid.point_data["ux"] = disp[:, 0]
+        grid.point_data["uy"] = disp[:, 1]
+        grid.point_data["uz"] = disp[:, 2]
+        grid.point_data["unorm"] = np.linalg.norm(disp, axis=1)
+
+        return {
+            "mesh": grid,
+            "grid": grid,
+            "scalars_name": "mode_shape",
+        }
+
+    def compute_frf(self, params: dict[str, Any]) -> dict[str, Any]:
+        """
+        Bridge FRF pour l'UI.
+        Pour l'instant, si l'UI demande une FRF modale, on retombe proprement
+        sur la FRF directe tant que la version modale UI-bridge n'est pas branchée.
+        """
+        self._apply_ui_params(params)
+        use_black_hole = self._ui_use_black_hole(params)
+
+        frf_params = params.get("frf", {})
+        method_requested = str(frf_params.get("method", "directe")).lower()
+
+        fmin = float(frf_params.get("fmin", 1.0))
+        fmax = float(frf_params.get("fmax", 1000.0))
+
+        eta = float(self.material_params.get("density", 2700.0))  # placeholder pour éviter un zéro impossible
+        _ = eta  # juste pour expliciter qu'on ne s'en sert pas directement ici
+
+        result = self.run_frf_direct(
+            sensor_name="UI_SENSOR",
+            use_black_hole=use_black_hole,
+            damping_ratio=0.01,
+            damping_freq1_hz=max(1.0, fmin),
+            damping_freq2_hz=max(fmin + 1.0, min(max(fmax, fmin + 1.0), 500.0)),
+            rebuild=True,
+        )
+
+        frf_result = result["frf_result"]
+
+        freq = None
+        H = None
+
+        if isinstance(frf_result, dict):
+            freq = frf_result.get("frequencies_hz", None) or frf_result.get("freq_hz", None)
+            H = frf_result.get("response", None) or frf_result.get("frf", None)
+        else:
+            if hasattr(frf_result, "frequencies_hz"):
+                freq = frf_result.frequencies_hz
+            elif hasattr(frf_result, "freq_hz"):
+                freq = frf_result.freq_hz
+
+            if hasattr(frf_result, "response"):
+                H = frf_result.response
+            elif hasattr(frf_result, "frf"):
+                H = frf_result.frf
+
+        if freq is None:
+            freq = []
+        if H is None:
+            H = []
+
+        return {
+            "method_requested": method_requested,
+            "method_used": "directe" if method_requested.startswith("mod") else method_requested,
+            "freq": np.asarray(freq).reshape(-1),
+            "frequencies": np.asarray(freq).reshape(-1),
+            "H": np.asarray(H).reshape(-1),
+            "frf_result": result,
+        }
 
     def get_case_summary(self) -> dict[str, Any]:
         return {
@@ -457,3 +809,314 @@ class SimulationManager3D:
             "excitation": dict(self.excitation_params),
             "sensors": {name: dict(params) for name, params in self.sensors.items()},
         }
+
+
+    # ------------------------------------------------------------------
+    # Pont UI <-> backend 3D
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _ui_dir_to_solver(direction: str | None, default: str = "z") -> str:
+        if direction is None:
+            return default
+        d = str(direction).strip().lower()
+        mapping = {"ux": "x", "uy": "y", "uz": "z", "x": "x", "y": "y", "z": "z"}
+        return mapping.get(d, default)
+
+    def _apply_ui_params(self, params: dict[str, Any]) -> None:
+        """
+        Traduit les paramètres issus de l'UI 3D vers l'API historique du manager.
+        """
+        if not params:
+            return
+
+        case_name = str(params.get("case", "vbh")).lower()
+        use_black_hole = case_name != "uniform"
+
+        plate = params.get("plate", {})
+        material = params.get("material", {})
+        vbh = params.get("vbh", {})
+        mesh = params.get("mesh", {})
+        modal = params.get("modal", {})
+        frf = params.get("frf", {})
+
+        # --- matériau ---
+        self.set_material(
+            young_modulus=float(material.get("E", self.material_params.get("young_modulus", 69e9))),
+            poisson_ratio=float(material.get("nu", self.material_params.get("poisson_ratio", 0.33))),
+            density=float(material.get("rho", self.material_params.get("density", 2700.0))),
+            name=str(material.get("name", self.material_params.get("name", "Aluminum"))),
+        )
+
+        # --- plaque ---
+        self.set_plate(
+            length_x=float(plate.get("lx", plate.get("length_x", self.plate_params.get("length_x", 0.50)))),
+            length_y=float(plate.get("ly", plate.get("length_y", self.plate_params.get("length_y", 0.40)))),
+            thickness=float(plate.get("h0", plate.get("thickness", self.plate_params.get("thickness", 0.002)))),
+            boundary_condition=str(plate.get("boundary_condition", self.plate_params.get("boundary_condition", "clamped"))),
+            name=str(plate.get("name", self.plate_params.get("name", "Plaque 3D solide"))),
+        )
+
+        # --- VBH ---
+        radius = float(vbh.get("radius", self.black_hole_params.get("radius", 0.06)))
+        trunc = float(vbh.get("truncation_radius", self.black_hole_params.get("truncation_radius", max(0.1 * radius, 1e-4))))
+        residual = float(vbh.get("h_residual", vbh.get("residual_thickness", self.black_hole_params.get("residual_thickness", 3e-4))))
+
+        self.set_black_hole(
+            xc=float(vbh.get("cx", vbh.get("xc", self.black_hole_params.get("xc", 0.25)))),
+            yc=float(vbh.get("cy", vbh.get("yc", self.black_hole_params.get("yc", 0.20)))),
+            radius=radius,
+            truncation_radius=trunc,
+            residual_thickness=residual,
+            exponent=float(vbh.get("m", vbh.get("exponent", self.black_hole_params.get("exponent", 2.0)))),
+            enabled=bool(vbh.get("enabled", use_black_hole)),
+        )
+
+        # --- maillage ---
+        refine_vbh = bool(mesh.get("refine_vbh", True))
+        local_ref_radius = radius if refine_vbh else 0.0
+        base_name = "abh" if use_black_hole else "uniform"
+        save_path = mesh.get("save_msh_path") or f"outputs/plate_abh_3d_manager_{base_name}.msh"
+
+        self.set_mesh(
+            element_order=int(mesh.get("order", self.mesh_params.get("element_order", 2))),
+            global_size=float(mesh.get("h_global", self.mesh_params.get("global_size", 0.012))),
+            local_size=float(mesh.get("h_local", self.mesh_params.get("local_size", 0.004))),
+            local_refinement_radius=float(mesh.get("local_refinement_radius", local_ref_radius)),
+            transition_thickness=float(mesh.get("transition_thickness", self.mesh_params.get("transition_thickness", max(radius * 0.25, 0.01)))),
+            top_surface_nu=int(mesh.get("top_surface_nu", self.mesh_params.get("top_surface_nu", 17))),
+            top_surface_nv=int(mesh.get("top_surface_nv", self.mesh_params.get("top_surface_nv", 13))),
+            algorithm_3d=int(mesh.get("algorithm_3d", self.mesh_params.get("algorithm_3d", 10))),
+            save_msh_path=str(save_path),
+            optimize_high_order=bool(mesh.get("optimize_high_order", self.mesh_params.get("optimize_high_order", False))),
+            high_order_opt_mode=int(mesh.get("high_order_opt_mode", self.mesh_params.get("high_order_opt_mode", 2))),
+            high_order_num_layers=int(mesh.get("high_order_num_layers", self.mesh_params.get("high_order_num_layers", 6))),
+            high_order_pass_max=int(mesh.get("high_order_pass_max", self.mesh_params.get("high_order_pass_max", 25))),
+            high_order_threshold_min=float(mesh.get("high_order_threshold_min", self.mesh_params.get("high_order_threshold_min", 0.1))),
+            high_order_threshold_max=float(mesh.get("high_order_threshold_max", self.mesh_params.get("high_order_threshold_max", 2.0))),
+            high_order_fix_boundary_nodes=int(mesh.get("high_order_fix_boundary_nodes", self.mesh_params.get("high_order_fix_boundary_nodes", 0))),
+            high_order_prim_surf_mesh=int(mesh.get("high_order_prim_surf_mesh", self.mesh_params.get("high_order_prim_surf_mesh", 1))),
+            high_order_iter_max=int(mesh.get("high_order_iter_max", self.mesh_params.get("high_order_iter_max", 100))),
+        )
+
+        # --- excitation / capteur UI ---
+        thickness = float(plate.get("h0", self.plate_params.get("thickness", 0.002)))
+        ex_xyz = list(frf.get("excitation", [0.10, 0.10, thickness]))
+        rp_xyz = list(frf.get("response", [0.30, 0.20, thickness]))
+        while len(ex_xyz) < 3:
+            ex_xyz.append(thickness)
+        while len(rp_xyz) < 3:
+            rp_xyz.append(thickness)
+
+        dir_solver = self._ui_dir_to_solver(frf.get("direction", "uz"))
+        fmin = float(frf.get("fmin", self.excitation_params.get("frequency_start", 50.0)))
+        fmax = float(frf.get("fmax", self.excitation_params.get("frequency_end", 700.0)))
+        n_points = int(frf.get("n_freq", self.excitation_params.get("n_points", 300)))
+
+        self.set_excitation(
+            x=float(ex_xyz[0]),
+            y=float(ex_xyz[1]),
+            z=float(ex_xyz[2] if ex_xyz[2] > 0.0 else thickness),
+            amplitude=float(frf.get("amplitude", self.excitation_params.get("amplitude", 1.0))),
+            frequency_start=fmin,
+            frequency_end=fmax,
+            n_points=n_points,
+            phase_deg=float(frf.get("phase_deg", self.excitation_params.get("phase_deg", 0.0))),
+            direction=dir_solver,
+        )
+
+        self.set_sensor(
+            name="UI_SENSOR",
+            x=float(rp_xyz[0]),
+            y=float(rp_xyz[1]),
+            z=float(rp_xyz[2] if rp_xyz[2] > 0.0 else thickness),
+            direction=dir_solver,
+            response_type=str(frf.get("response_type", "displacement")),
+        )
+
+        # stocker quelques infos UI utiles
+        self.last_results["ui_context"] = {
+            "use_black_hole": use_black_hole,
+            "n_modes": int(modal.get("n_modes", 20)),
+            "frf_method": str(frf.get("method", "directe")).lower(),
+            "frf_n_modes": int(frf.get("n_modes", 40)),
+            "display_component": str(modal.get("component", "norm")),
+            "display_scale": float(modal.get("scale", 1.0)),
+            "compare_uniform_vs_vbh": bool(modal.get("compare_uniform_vs_vbh", False)),
+        }
+
+    def _mesh_stats(self, model: Solid3DFEMModel) -> dict[str, Any]:
+        mesh = model.mesh
+        if mesh is None:
+            return {}
+        return {
+            "n_points": int(mesh.n_points),
+            "n_cells": int(mesh.n_cells),
+            "element_order": int(mesh.element_order),
+            "n_nodes_per_cell": int(mesh.n_nodes_per_cell),
+            "boundary_condition": str(model.plate.boundary_condition),
+            "use_black_hole": bool(model.use_black_hole),
+        }
+
+    def preview_mesh(self, params: dict[str, Any]) -> dict[str, Any]:
+        self._apply_ui_params(params)
+        use_black_hole = bool(self.last_results.get("ui_context", {}).get("use_black_hole", True))
+        model = self.get_model(use_black_hole=use_black_hole, rebuild=True)
+
+        grid = None
+        if model.mesh is not None:
+            try:
+                grid = model.mesh.to_pyvista()
+            except Exception:
+                grid = None
+
+        result = {
+            "model": model,
+            "mesh_data": model.mesh,
+            "mesh": grid,
+            "stats": self._mesh_stats(model),
+        }
+        self.last_results["mesh_preview_3d"] = result
+        return result
+
+    def generate_mesh(self, params: dict[str, Any]) -> dict[str, Any]:
+        # pour cette branche, générer le maillage revient à construire le modèle 3D complet
+        return self.preview_mesh(params)
+
+    def solve_modal(self, params: dict[str, Any]) -> dict[str, Any]:
+        self._apply_ui_params(params)
+        ui = self.last_results.get("ui_context", {})
+        use_black_hole = bool(ui.get("use_black_hole", True))
+        n_modes = int(ui.get("n_modes", 20))
+
+        analysis = self.run_modal_analysis(
+            n_modes=n_modes,
+            use_black_hole=use_black_hole,
+            rebuild=False,
+        )
+
+        result = {
+            "model": analysis["model"],
+            "freqs": analysis["frequencies_hz"],
+            "frequencies": analysis["frequencies_hz"],
+            "modes_full": analysis["modes_full"],
+            "modes_free": analysis["modes_free"],
+            "omegas_rad_s": analysis["omegas_rad_s"],
+            "eigenvalues": analysis["eigenvalues"],
+            "modal_masses": analysis["modal_masses"],
+        }
+
+        if bool(ui.get("compare_uniform_vs_vbh", False)):
+            try:
+                comp = self.compare_modal(n_modes=n_modes)
+                result["comparison"] = {
+                    "frequencies_uniform_hz": comp["frequencies_uniform_hz"],
+                    "frequencies_abh_hz": comp["frequencies_abh_hz"],
+                }
+            except Exception as exc:
+                result["comparison_error"] = str(exc)
+
+        self.last_results["modal_3d_ui"] = result
+        return result
+
+    def get_mode_shape(
+        self,
+        modal_result: dict[str, Any],
+        mode_index: int,
+        component: str = "norm",
+        scale: float = 1.0,
+    ) -> dict[str, Any]:
+        model: Solid3DFEMModel = modal_result["model"]
+        mesh = model.mesh
+        if mesh is None:
+            raise RuntimeError("Le maillage 3D n'est pas disponible pour l'affichage du mode.")
+
+        modes_full = np.asarray(modal_result["modes_full"])
+        if modes_full.ndim != 2:
+            raise ValueError("modes_full doit être une matrice 2D.")
+        if mode_index < 0 or mode_index >= modes_full.shape[1]:
+            raise IndexError("Indice de mode hors limites.")
+
+        disp = modes_full[:, mode_index].reshape(-1, 3).astype(float)
+        max_amp = float(np.max(np.linalg.norm(disp, axis=1)))
+        if max_amp > 1e-16:
+            disp = disp / max_amp
+
+        try:
+            grid = mesh.to_pyvista()
+        except Exception as exc:
+            raise RuntimeError(f"Conversion PyVista impossible : {exc}") from exc
+
+        grid.point_data["disp"] = disp
+        grid.point_data["ux"] = disp[:, 0]
+        grid.point_data["uy"] = disp[:, 1]
+        grid.point_data["uz"] = disp[:, 2]
+        grid.point_data["umag"] = np.linalg.norm(disp, axis=1)
+
+        scalar_name = {"ux": "ux", "uy": "uy", "uz": "uz", "norm": "umag", "umag": "umag"}.get(str(component).lower(), "umag")
+        warped = grid.warp_by_vector("disp", factor=float(scale))
+
+        return {
+            "mesh": warped,
+            "grid": warped,
+            "scalars_name": scalar_name,
+            "mode_index": int(mode_index),
+        }
+
+    def compute_frf(self, params: dict[str, Any]) -> dict[str, Any]:
+        self._apply_ui_params(params)
+        ui = self.last_results.get("ui_context", {})
+        use_black_hole = bool(ui.get("use_black_hole", True))
+        method = str(ui.get("frf_method", "directe")).lower()
+        sensor_name = "UI_SENSOR"
+
+        # on utilise le facteur de pertes UI comme approx. simple du taux modal
+        eta = float(params.get("material", {}).get("eta", 0.01))
+        damping_ratio = max(0.0, float(eta))
+
+        if method.startswith("modal"):
+            n_modes = int(ui.get("frf_n_modes", 40))
+            model = self.get_model(use_black_hole=use_black_hole, rebuild=False)
+            basis = self.get_modal_basis(n_modes=n_modes, use_black_hole=use_black_hole, rebuild=False)
+            solver = ModalFRFSolver3D(model, verbose=True)
+            frf = solver.solve(
+                excitation=self.build_excitation(),
+                sensor=self.build_sensor(sensor_name),
+                n_modes=n_modes,
+                damping=damping_ratio if damping_ratio > 0.0 else 0.01,
+                modal_basis=basis,
+            )
+            result = {
+                "method": "modal",
+                "freq": frf.frequencies_hz,
+                "frequencies": frf.frequencies_hz,
+                "H": frf.frf_complex,
+                "frf": frf.frf_complex,
+                "response": frf.response_complex,
+                "frf_result": frf,
+                "n_modes_used": int(frf.n_modes_used),
+            }
+        else:
+            exc = self.build_excitation()
+            f1 = max(1.0, float(exc.frequency_start))
+            f2 = max(f1 + 1.0, min(float(exc.frequency_end), max(float(exc.frequency_end), 2.0 * f1)))
+            direct = self.run_frf_direct(
+                sensor_name=sensor_name,
+                use_black_hole=use_black_hole,
+                damping_ratio=damping_ratio if damping_ratio > 0.0 else 0.01,
+                damping_freq1_hz=f1,
+                damping_freq2_hz=f2,
+                rebuild=False,
+            )
+            frf = direct["frf_result"]
+            result = {
+                "method": "direct",
+                "freq": frf.frequencies_hz,
+                "frequencies": frf.frequencies_hz,
+                "H": frf.frf_complex,
+                "frf": frf.frf_complex,
+                "response": frf.response_complex,
+                "frf_result": frf,
+            }
+
+        self.last_results["frf_3d_ui"] = result
+        return result
