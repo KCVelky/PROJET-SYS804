@@ -1,0 +1,72 @@
+{
+  "visco": {
+    "enabled": false,
+    "radius": 0.006,
+    "thickness": 0.00015,
+    "E": 2000000000.0,
+    "rho": 1160.0,
+    "eta": 0.15
+  },
+  "case": "uniform",
+  "plate": {
+    "lx": 0.5,
+    "ly": 0.4,
+    "h0": 0.002,
+    "boundary_condition": "clamped"
+  },
+  "material": {
+    "E": 69000000000.0,
+    "nu": 0.33,
+    "rho": 2700.0,
+    "eta": 0.002
+  },
+  "vbh": {
+    "cx": 0.25,
+    "cy": 0.2,
+    "radius": 0.06,
+    "truncation_radius": 0.005,
+    "h_residual": 0.0003,
+    "m": 2.0
+  },
+  "mesh": {
+    "order": 2,
+    "h_global": 0.012,
+    "h_local": 0.004,
+    "refinement_radius": 0.03,
+    "transition_thickness": 0.01,
+    "top_surface_nu": 17,
+    "top_surface_nv": 13,
+    "optimize_high_order": true,
+    "show_edges": true
+  },
+  "modal": {
+    "n_modes": 40,
+    "compare_uniform_vs_vbh": true,
+    "component": "norm",
+    "scale": 0.05,
+    "damping_ratio": 0.01
+  },
+  "frf": {
+    "method": "directe",
+    "fmin": 50.0,
+    "fmax": 700.0,
+    "n_freq": 300,
+    "n_modes": 40,
+    "excitation": [
+      0.1,
+      0.1,
+      0.002
+    ],
+    "response": [
+      0.35,
+      0.25,
+      0.002
+    ],
+    "direction": "ux",
+    "response_type": "displacement"
+  },
+  "post": {
+    "center_cut": true,
+    "show_profile": true
+  }
+}

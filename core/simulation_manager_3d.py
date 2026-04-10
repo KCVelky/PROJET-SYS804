@@ -1070,8 +1070,28 @@ class SimulationManager3D:
         sensor_name = "UI_SENSOR"
 
         # on utilise le facteur de pertes UI comme approx. simple du taux modal
-        eta = float(params.get("material", {}).get("eta", 0.01))
-        damping_ratio = max(0.0, float(eta))
+        eta_base = float(params.get("material", {}).get("eta", 0.01))
+        damping_ratio = max(0.0, float(eta_base))
+
+        visco = params.get("visco", {})
+        if use_black_hole and bool(visco.get("enabled", False)):
+            vbh = params.get("vbh", {})
+            plate = params.get("plate", {})
+
+            r_patch = float(visco.get("radius", 0.0))
+            h_patch = float(visco.get("thickness", 0.0))
+            eta_patch = float(visco.get("eta", 0.15))
+
+            r_vbh = max(1e-9, float(vbh.get("radius", 0.06)))
+            h0 = max(1e-9, float(plate.get("h0", 0.002)))
+
+            area_ratio = min(1.0, (r_patch / r_vbh) ** 2)
+            thickness_ratio = min(1.0, h_patch / h0)
+
+            concentration_gain = 4.0
+            delta_zeta = concentration_gain * eta_patch * area_ratio * thickness_ratio
+
+            damping_ratio = min(0.25, damping_ratio + delta_zeta)
 
         if method.startswith("modal"):
             n_modes = int(ui.get("frf_n_modes", 40))

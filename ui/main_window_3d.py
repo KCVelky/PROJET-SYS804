@@ -159,8 +159,6 @@ class Viewer3D(QWidget):
         self.plotter.clear()
         try:
             to_plot = dataset
-            if "disp" in dataset.point_data:
-                to_plot = dataset.warp_by_vector("disp", factor=1.0)
             surface = to_plot.extract_surface(algorithm="dataset_surface")
             self.plotter.add_mesh(surface, scalars=scalars_name, show_edges=show_edges)
             self.plotter.add_axes()
@@ -177,6 +175,12 @@ class MainWindow3D(QMainWindow):
         self.modal_result = None
         self.frf_result = None
 
+        self.modal_result_uniform = None
+        self.modal_result_vbh = None
+        self.current_modal_case = "vbh"
+
+        self.current_display_case = "Uniforme"
+
         self.setWindowTitle("SYS804 - VBH 3D")
         self.resize(1500, 920)
         self.setStatusBar(QStatusBar())
@@ -187,6 +191,24 @@ class MainWindow3D(QMainWindow):
     # --------------------------------------------------------
     # UI
     # --------------------------------------------------------
+
+    def _update_display_case_label(self, case_name: str, visco_enabled: bool = False):
+        text = "Uniforme" if case_name == "uniform" else "VBH"
+        if case_name != "uniform" and visco_enabled:
+            text += " + visco"
+        self.current_display_case = text
+        self.view_case_label.setText(f"Affichage courant : {text}")
+    
+    def _draw_display_case_overlay(self):
+        if self.viewer.plotter is None:
+            return
+        self.viewer.plotter.add_text(
+            f"Affichage : {self.current_display_case}",
+            position="upper_right",
+            font_size=10,
+            color="black",
+        )
+
     def _build_ui(self):
         self._build_toolbar()
 
@@ -305,6 +327,54 @@ class MainWindow3D(QMainWindow):
             QStatusBar { background: #e9edf3; color: #111827; }
             QToolBar { background: #f8fafc; border-bottom: 1px solid #d9dee7; spacing: 6px; }
         """)
+    
+    def _load_modal_result_into_ui(self, result: dict, modal_case: str):
+        self.modal_result = result
+        self.current_modal_case = modal_case
+
+        freqs = np.asarray(result.get("freqs", []), dtype=float)
+
+        current_index = self.mode_combo.currentIndex()
+        self.mode_combo.blockSignals(True)
+        self.mode_combo.clear()
+        for i, f in enumerate(freqs, start=1):
+            self.mode_combo.addItem(f"Mode {i} - {f:.3f} Hz", i - 1)
+        self.mode_combo.blockSignals(False)
+
+        if len(freqs):
+            if 0 <= current_index < len(freqs):
+                self.mode_combo.setCurrentIndex(current_index)
+            else:
+                self.mode_combo.setCurrentIndex(0)
+
+        self.plot_panel.plot_modes(freqs)
+        self.toggle_modal_case_btn.setText(
+            f"Afficher : {'VBH' if modal_case == 'vbh' else 'Uniforme'}"
+        )
+
+        visco = self._collect_params().get("visco", {})
+        self._update_display_case_label(
+            modal_case,
+            visco_enabled=(modal_case != "uniform" and bool(visco.get("enabled", False))),
+        )
+
+    def on_toggle_modal_case(self):
+        if self.modal_result_uniform is None and self.modal_result_vbh is None:
+            self._log("Aucun résultat modal disponible.")
+            return
+
+        if self.modal_result_uniform is None or self.modal_result_vbh is None:
+            self._log("La bascule uniforme/VBH n'est dispo que si les deux cas ont été calculés.")
+            return
+
+        if self.current_modal_case == "vbh":
+            self._load_modal_result_into_ui(self.modal_result_uniform, "uniform")
+            self._log("Affichage basculé vers le cas uniforme.")
+        else:
+            self._load_modal_result_into_ui(self.modal_result_vbh, "vbh")
+            self._log("Affichage basculé vers le cas VBH.")
+
+        self.on_show_mode()
 
     # --------------------------------------------------------
     # Tabs
@@ -363,6 +433,25 @@ class MainWindow3D(QMainWindow):
         layout.addWidget(plate_box)
         layout.addWidget(mat_box)
         layout.addWidget(vbh_box)
+
+        visco_box = QGroupBox("Film viscoélastique")
+        visco_form = QFormLayout(visco_box)
+
+        self.visco_enable_check = QCheckBox("Activer le film")
+        self.visco_radius_spin = self._dbl(0.006, 0.0005, 1.0, 0.0005, " m", 4)
+        self.visco_thickness_spin = self._dbl(0.00015, 0.00001, 0.01, 0.00001, " m", 6)
+        self.visco_E_spin = self._dbl(2.0e9, 1e6, 1e11, 1e8, " Pa", 0)
+        self.visco_rho_spin = self._dbl(1160.0, 100.0, 5000.0, 10.0, " kg/m³", 1)
+        self.visco_eta_spin = self._dbl(0.15, 0.0, 2.0, 0.01, decimals=3)
+
+        visco_form.addRow("", self.visco_enable_check)
+        visco_form.addRow("Rayon patch", self.visco_radius_spin)
+        visco_form.addRow("Épaisseur film", self.visco_thickness_spin)
+        visco_form.addRow("Module film", self.visco_E_spin)
+        visco_form.addRow("Densité film", self.visco_rho_spin)
+        visco_form.addRow("Facteur pertes film", self.visco_eta_spin)
+
+        layout.addWidget(visco_box)
         layout.addStretch(1)
         return w
 
@@ -410,16 +499,25 @@ class MainWindow3D(QMainWindow):
         self.n_modes_spin = QSpinBox(); self.n_modes_spin.setRange(1, 300); self.n_modes_spin.setValue(20)
         self.mode_combo = QComboBox(); self.mode_combo.currentIndexChanged.connect(self.on_show_mode)
         self.component_combo = QComboBox(); self.component_combo.addItems(["norm", "ux", "uy", "uz"])
-        self.scale_spin = self._dbl(1.0, 0.01, 1e6, 0.1, decimals=2)
+        self.scale_spin = self._dbl(0.001, 0.00001, 1.0, 0.0001, decimals=4)
         self.compare_modal_check = QCheckBox("Comparer uniforme / VBH")
         self.compare_modal_check.setChecked(True)
+        self.toggle_modal_case_btn = QPushButton("Afficher : VBH")
+        self.toggle_modal_case_btn.clicked.connect(self.on_toggle_modal_case)
         self.damping_ratio_spin = self._dbl(0.01, 0.0, 1.0, 0.001, decimals=4)
+        self.view_case_label = QLabel("Affichage courant : Uniforme")
+        self.view_case_label.setStyleSheet(
+            "QLabel { background: #eef6ff; color: #0f172a; border: 1px solid #bfdbfe; "
+            "border-radius: 8px; padding: 6px 10px; font-weight: 600; }"
+        )
+        form.addRow("Vue courante", self.view_case_label)
         form.addRow("Nombre de modes", self.n_modes_spin)
         form.addRow("Mode affiché", self.mode_combo)
         form.addRow("Composante", self.component_combo)
         form.addRow("Facteur d'échelle", self.scale_spin)
         form.addRow("Amortissement ζ", self.damping_ratio_spin)
         form.addRow("", self.compare_modal_check)
+        form.addRow("", self.toggle_modal_case_btn)
         layout.addWidget(box)
         layout.addStretch(1)
         return w
@@ -524,6 +622,16 @@ class MainWindow3D(QMainWindow):
 
     def _collect_params(self):
         return {
+            
+            "visco": {
+                "enabled": self.visco_enable_check.isChecked(),
+                "radius": self.visco_radius_spin.value(),
+                "thickness": self.visco_thickness_spin.value(),
+                "E": self.visco_E_spin.value(),
+                "rho": self.visco_rho_spin.value(),
+                "eta": self.visco_eta_spin.value(),
+            },
+
             "case": "uniform" if self.case_combo.currentIndex() == 0 else "vbh",
             "plate": {
                 "lx": self.lx_spin.value(),
@@ -589,6 +697,14 @@ class MainWindow3D(QMainWindow):
         bc = plate.get("boundary_condition", self.bc_combo.currentText())
         idx = max(0, self.bc_combo.findText(bc))
         self.bc_combo.setCurrentIndex(idx)
+
+        visco = cfg.get("visco", {})
+        self.visco_enable_check.setChecked(visco.get("enabled", self.visco_enable_check.isChecked()))
+        self.visco_radius_spin.setValue(visco.get("radius", self.visco_radius_spin.value()))
+        self.visco_thickness_spin.setValue(visco.get("thickness", self.visco_thickness_spin.value()))
+        self.visco_E_spin.setValue(visco.get("E", self.visco_E_spin.value()))
+        self.visco_rho_spin.setValue(visco.get("rho", self.visco_rho_spin.value()))
+        self.visco_eta_spin.setValue(visco.get("eta", self.visco_eta_spin.value()))
 
         material = cfg.get("material", {})
         self.E_spin.setValue(material.get("E", self.E_spin.value()))
@@ -658,6 +774,16 @@ class MainWindow3D(QMainWindow):
         except Exception as exc:
             self._log(f"[ERREUR] preview_mesh: {exc}")
             QMessageBox.critical(self, "Erreur aperçu", str(exc))
+        
+        visco = self._collect_params().get("visco", {})
+        self._update_display_case_label(
+            self.current_modal_case,
+            visco_enabled=(
+                self.current_modal_case != "uniform"
+                and bool(visco.get("enabled", False))
+            ),
+        )
+        self._draw_display_case_overlay()
 
     def on_generate_mesh(self):
         params = self._collect_params()
@@ -678,27 +804,75 @@ class MainWindow3D(QMainWindow):
     def on_compute_modal(self):
         params = self._collect_params()
         self._log("Calcul modal 3D...")
+
         try:
-            result = self.manager.solve_modal(params)
-            self.modal_result = result
-            freqs = np.asarray(result.get("freqs", []), dtype=float)
-            self.mode_combo.clear()
-            for i, f in enumerate(freqs, start=1):
-                self.mode_combo.addItem(f"Mode {i} - {f:.3f} Hz", i - 1)
-            self.plot_panel.plot_modes(freqs)
-            summary = {
-                "action": "modal",
-                "nb_modes": len(freqs),
-                "f1_Hz": float(freqs[0]) if len(freqs) else "-",
-            }
-            comparison = result.get("comparison")
-            if comparison is not None:
-                summary["f1_uniform_Hz"] = float(comparison["frequencies_uniform_hz"][0])
-                summary["f1_vbh_Hz"] = float(comparison["frequencies_abh_hz"][0])
-            self._set_results(summary)
+            compare_cases = self.compare_modal_check.isChecked()
+            requested_case = params.get("case", "vbh")
+
+            self.modal_result_uniform = None
+            self.modal_result_vbh = None
+
+            if compare_cases:
+                params_uniform = dict(params)
+                params_uniform["case"] = "uniform"
+
+                params_vbh = dict(params)
+                params_vbh["case"] = "vbh"
+
+                self._log("Calcul modal cas uniforme...")
+                self.modal_result_uniform = self.manager.solve_modal(params_uniform)
+
+                self._log("Calcul modal cas VBH...")
+                self.modal_result_vbh = self.manager.solve_modal(params_vbh)
+
+                if requested_case == "uniform":
+                    active_result = self.modal_result_uniform
+                    active_case = "uniform"
+                else:
+                    active_result = self.modal_result_vbh
+                    active_case = "vbh"
+
+                self._load_modal_result_into_ui(active_result, active_case)
+
+                freqs_u = np.asarray(self.modal_result_uniform.get("freqs", []), dtype=float)
+                freqs_b = np.asarray(self.modal_result_vbh.get("freqs", []), dtype=float)
+
+                summary = {
+                    "action": "modal",
+                    "cas_actif": active_case,
+                    "nb_modes_uniforme": len(freqs_u),
+                    "nb_modes_vbh": len(freqs_b),
+                    "f1_uniform_Hz": float(freqs_u[0]) if len(freqs_u) else "-",
+                    "f1_vbh_Hz": float(freqs_b[0]) if len(freqs_b) else "-",
+                }
+                self._set_results(summary)
+
+            else:
+                result = self.manager.solve_modal(params)
+
+                if requested_case == "uniform":
+                    self.modal_result_uniform = result
+                    active_case = "uniform"
+                else:
+                    self.modal_result_vbh = result
+                    active_case = "vbh"
+
+                self._load_modal_result_into_ui(result, active_case)
+
+                freqs = np.asarray(result.get("freqs", []), dtype=float)
+                summary = {
+                    "action": "modal",
+                    "cas_actif": active_case,
+                    "nb_modes": len(freqs),
+                    "f1_Hz": float(freqs[0]) if len(freqs) else "-",
+                }
+                self._set_results(summary)
+
             self._log("Calcul modal terminé.")
-            if len(freqs):
+
+            if self.modal_result is not None:
                 self.on_show_mode()
+
         except Exception as exc:
             self._log(f"[ERREUR] modal: {exc}")
             QMessageBox.critical(self, "Erreur calcul modal", str(exc))
@@ -718,6 +892,7 @@ class MainWindow3D(QMainWindow):
             self.viewer.show_mode(mesh, scalars_name=result.get("scalars_name", "mode_shape"), show_edges=False)
         except Exception as exc:
             self._log(f"[ERREUR] show_mode: {exc}")
+        self._draw_display_case_overlay()
 
     def on_compute_frf(self):
         params = self._collect_params()
