@@ -83,6 +83,30 @@ class PlotPanel(QWidget):
         self.ax.grid(True, alpha=0.25)
         self.canvas.draw_idle()
 
+    def plot_curves(self, curves, title="", xlabel="", ylabel=""):
+        if self.ax is None:
+            return
+        self.ax.clear()
+        any_label = False
+        for curve in curves:
+            x = np.asarray(curve.get("x", []), dtype=float)
+            y = np.asarray(curve.get("y", []), dtype=float)
+            if not len(x) or not len(y):
+                continue
+            label = str(curve.get("label", "")).strip()
+            if label:
+                any_label = True
+                self.ax.plot(x, y, label=label)
+            else:
+                self.ax.plot(x, y)
+        self.ax.set_title(title)
+        self.ax.set_xlabel(xlabel)
+        self.ax.set_ylabel(ylabel)
+        self.ax.grid(True, alpha=0.25)
+        if any_label:
+            self.ax.legend()
+        self.canvas.draw_idle()
+
     def plot_modes(self, freqs):
         if self.ax is None:
             return
@@ -94,6 +118,11 @@ class PlotPanel(QWidget):
         self.ax.set_ylabel("Fréquence (Hz)")
         self.ax.grid(True, alpha=0.25)
         self.canvas.draw_idle()
+
+    def export_png(self, filepath: str):
+        if self.figure is None:
+            raise RuntimeError("Matplotlib non disponible : export FRF impossible.")
+        self.figure.savefig(filepath, dpi=200, bbox_inches="tight")
 
 
 class Viewer3D(QWidget):
@@ -233,6 +262,11 @@ class MainWindow3D(QMainWindow):
             ("Mailler", self.on_generate_mesh),
             ("Calcul modal", self.on_compute_modal),
             ("Calcul FRF", self.on_compute_frf),
+            ("Vue face", self.on_view_face),
+            ("Vue côté", self.on_view_side),
+            ("Vue générale", self.on_view_general),
+            ("Exporter vue 3D PNG", self.on_export_view_png),
+            ("Exporter FRF PNG", self.on_export_frf_png),
         ]:
             btn = QPushButton(text)
             btn.clicked.connect(slot)
@@ -551,7 +585,24 @@ class MainWindow3D(QMainWindow):
         form.addRow("Réponse y", self.ry_spin)
         form.addRow("Réponse z", self.rz_spin)
         form.addRow("Direction mesurée", self.dir_combo)
+
+        overlay_box = QGroupBox("Superposition des FRF")
+        overlay_form = QFormLayout(overlay_box)
+        self.frf_overlay_check = QCheckBox("Superposer les FRF sélectionnées")
+        self.frf_overlay_check.setChecked(True)
+        self.frf_uniform_check = QCheckBox("Plaque uniforme")
+        self.frf_uniform_check.setChecked(True)
+        self.frf_vbh_check = QCheckBox("VBH seul")
+        self.frf_vbh_check.setChecked(True)
+        self.frf_vbh_film_check = QCheckBox("VBH + film")
+        self.frf_vbh_film_check.setChecked(True)
+        overlay_form.addRow("", self.frf_overlay_check)
+        overlay_form.addRow("", self.frf_uniform_check)
+        overlay_form.addRow("", self.frf_vbh_check)
+        overlay_form.addRow("", self.frf_vbh_film_check)
+
         layout.addWidget(box)
+        layout.addWidget(overlay_box)
         layout.addStretch(1)
         return w
 
@@ -681,6 +732,10 @@ class MainWindow3D(QMainWindow):
                 "response": [self.rx_spin.value(), self.ry_spin.value(), self.rz_spin.value()],
                 "direction": self.dir_combo.currentText(),
                 "response_type": "displacement",
+                "overlay_enabled": self.frf_overlay_check.isChecked(),
+                "overlay_uniform": self.frf_uniform_check.isChecked(),
+                "overlay_vbh": self.frf_vbh_check.isChecked(),
+                "overlay_vbh_film": self.frf_vbh_film_check.isChecked(),
             },
             "post": {
                 "center_cut": self.cut_center_check.isChecked(),
@@ -753,8 +808,79 @@ class MainWindow3D(QMainWindow):
         direction = frf.get("direction", self.dir_combo.currentText())
         idx = max(0, self.dir_combo.findText(direction))
         self.dir_combo.setCurrentIndex(idx)
+        self.frf_overlay_check.setChecked(frf.get("overlay_enabled", self.frf_overlay_check.isChecked()))
+        self.frf_uniform_check.setChecked(frf.get("overlay_uniform", self.frf_uniform_check.isChecked()))
+        self.frf_vbh_check.setChecked(frf.get("overlay_vbh", self.frf_vbh_check.isChecked()))
+        self.frf_vbh_film_check.setChecked(frf.get("overlay_vbh_film", self.frf_vbh_film_check.isChecked()))
 
         self._update_vbh_enabled()
+
+    def _clone_params_with_case(self, params: dict, case: str, visco_enabled: bool | None = None) -> dict:
+        cfg = json.loads(json.dumps(params))
+        cfg["case"] = str(case)
+        if visco_enabled is not None:
+            cfg.setdefault("visco", {})["enabled"] = bool(visco_enabled)
+        return cfg
+
+    def _plot_saved_frf_result(self, result: dict):
+        if not result:
+            return
+        curves = result.get("curves")
+        if curves:
+            self.plot_panel.plot_curves(
+                curves,
+                title=result.get("title", "FRF 3D"),
+                xlabel="Fréquence (Hz)",
+                ylabel="|H|",
+            )
+            return
+        freq = np.asarray(result.get("freq", []), dtype=float)
+        H = np.asarray(result.get("H", []))
+        if len(freq) and len(H):
+            self.plot_panel.plot_curve(freq, np.abs(H), title="FRF 3D", xlabel="Fréquence (Hz)", ylabel="|H|")
+
+    def on_view_face(self):
+        self.viewer.set_standard_view("face")
+
+    def on_view_side(self):
+        self.viewer.set_standard_view("side")
+
+    def on_view_general(self):
+        self.viewer.set_standard_view("general")
+
+    def on_export_view_png(self):
+        filename, _ = QFileDialog.getSaveFileName(
+            self,
+            "Exporter la vue 3D en PNG",
+            "vue_3d.png",
+            "Images PNG (*.png)",
+        )
+        if not filename:
+            return
+        try:
+            self.viewer.export_current_view_png(filename)
+            self._log(f"Vue 3D exportée : {filename}")
+            self.statusBar().showMessage(f"Vue 3D exportée : {filename}", 4000)
+        except Exception as exc:
+            self._log(f"[ERREUR] export vue 3D: {exc}")
+            QMessageBox.critical(self, "Erreur export vue 3D", str(exc))
+
+    def on_export_frf_png(self):
+        filename, _ = QFileDialog.getSaveFileName(
+            self,
+            "Exporter la FRF en PNG",
+            "frf.png",
+            "Images PNG (*.png)",
+        )
+        if not filename:
+            return
+        try:
+            self.plot_panel.export_png(filename)
+            self._log(f"FRF exportée : {filename}")
+            self.statusBar().showMessage(f"FRF exportée : {filename}", 4000)
+        except Exception as exc:
+            self._log(f"[ERREUR] export FRF: {exc}")
+            QMessageBox.critical(self, "Erreur export FRF", str(exc))
 
     # --------------------------------------------------------
     # Actions
@@ -898,19 +1024,56 @@ class MainWindow3D(QMainWindow):
         params = self._collect_params()
         self._log("Calcul FRF 3D...")
         try:
-            result = self.manager.compute_frf(params)
-            self.frf_result = result
-            freq = np.asarray(result.get("freq", []), dtype=float)
-            H = np.asarray(result.get("H", []))
-            if len(freq) and len(H):
-                self.plot_panel.plot_curve(freq, np.abs(H), title="FRF 3D", xlabel="Fréquence (Hz)", ylabel="|H|")
-            self._set_results({
-                "action": "frf",
-                "méthode": self.method_combo.currentText(),
-                "fmin": self.fmin_spin.value(),
-                "fmax": self.fmax_spin.value(),
-                "n_points": self.n_freq_spin.value(),
-            })
+            overlay_enabled = self.frf_overlay_check.isChecked()
+            selected = []
+            if overlay_enabled:
+                if self.frf_uniform_check.isChecked():
+                    selected.append(("Plaque uniforme", self._clone_params_with_case(params, "uniform", visco_enabled=False)))
+                if self.frf_vbh_check.isChecked():
+                    selected.append(("VBH seul", self._clone_params_with_case(params, "vbh", visco_enabled=False)))
+                if self.frf_vbh_film_check.isChecked():
+                    selected.append(("VBH + film", self._clone_params_with_case(params, "vbh", visco_enabled=True)))
+
+            if overlay_enabled and len(selected) >= 1:
+                curves = []
+                stored_cases = {}
+                for label, cfg in selected:
+                    frf_case = self.manager.compute_frf(cfg)
+                    freq = np.asarray(frf_case.get("freq", []), dtype=float)
+                    H = np.asarray(frf_case.get("H", []))
+                    if len(freq) and len(H):
+                        curves.append({"x": freq, "y": np.abs(H), "label": label})
+                    stored_cases[label] = {
+                        "freq": freq,
+                        "H": H,
+                        "method": frf_case.get("method", ""),
+                    }
+
+                self.frf_result = {
+                    "title": "FRF 3D superposées",
+                    "curves": curves,
+                    "cases": stored_cases,
+                }
+                self._plot_saved_frf_result(self.frf_result)
+                self._set_results({
+                    "action": "frf_overlay",
+                    "méthode": self.method_combo.currentText(),
+                    "courbes": len(curves),
+                    "fmin": self.fmin_spin.value(),
+                    "fmax": self.fmax_spin.value(),
+                    "n_points": self.n_freq_spin.value(),
+                })
+            else:
+                result = self.manager.compute_frf(params)
+                self.frf_result = result
+                self._plot_saved_frf_result(result)
+                self._set_results({
+                    "action": "frf",
+                    "méthode": self.method_combo.currentText(),
+                    "fmin": self.fmin_spin.value(),
+                    "fmax": self.fmax_spin.value(),
+                    "n_points": self.n_freq_spin.value(),
+                })
             self._log("Calcul FRF terminé.")
         except Exception as exc:
             self._log(f"[ERREUR] frf: {exc}")
@@ -923,7 +1086,15 @@ class MainWindow3D(QMainWindow):
         try:
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(self._collect_params(), f, indent=2, ensure_ascii=False)
+            cache_path = self.manager.save_ui_cache(
+                path,
+                modal_result_uniform=self.modal_result_uniform,
+                modal_result_vbh=self.modal_result_vbh,
+                frf_result=self.frf_result,
+            )
             self._log(f"Configuration sauvée: {path}")
+            if cache_path is not None:
+                self._log(f"Résultats sauvegardés: {cache_path}")
         except Exception as exc:
             QMessageBox.critical(self, "Erreur sauvegarde", str(exc))
 
@@ -935,7 +1106,29 @@ class MainWindow3D(QMainWindow):
             with open(path, "r", encoding="utf-8") as f:
                 cfg = json.load(f)
             self._load_params(cfg)
+            cache = self.manager.load_ui_cache(path)
+
+            self.modal_result_uniform = cache.get("modal_result_uniform")
+            self.modal_result_vbh = cache.get("modal_result_vbh")
+            self.frf_result = cache.get("frf_result")
+
+            active_case = cfg.get("case", "vbh")
+            if active_case == "uniform" and self.modal_result_uniform is not None:
+                self._load_modal_result_into_ui(self.modal_result_uniform, "uniform")
+                self.on_show_mode()
+            elif self.modal_result_vbh is not None:
+                self._load_modal_result_into_ui(self.modal_result_vbh, "vbh")
+                self.on_show_mode()
+            elif self.modal_result_uniform is not None:
+                self._load_modal_result_into_ui(self.modal_result_uniform, "uniform")
+                self.on_show_mode()
+
+            if self.frf_result is not None:
+                self._plot_saved_frf_result(self.frf_result)
+
             self._log(f"Configuration chargée: {path}")
+            if cache.get("cache_path"):
+                self._log(f"Résultats restaurés: {cache['cache_path']}")
         except Exception as exc:
             QMessageBox.critical(self, "Erreur chargement", str(exc))
 

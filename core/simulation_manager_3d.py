@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from typing import Any
+from pathlib import Path
+import json
 
 import numpy as np
 
@@ -17,6 +19,7 @@ from solid3d import (
     Solid3DFEMModel,
     Solid3DMeshOptions,
 )
+from solid3d.mesh_data_3d import Mesh3DData
 
 
 class SimulationManager3D:
@@ -743,6 +746,162 @@ class SimulationManager3D:
             "scalars_name": "mode_shape",
         }
 
+    def _cache_path_from_config(self, config_path: str | Path) -> Path:
+        cfg = Path(config_path)
+        return cfg.with_suffix(".session3d.npz")
+
+    def _extract_mesh_data(self, modal_result: dict[str, Any] | None) -> Mesh3DData | None:
+        if not modal_result:
+            return None
+        mesh = modal_result.get("mesh_data")
+        if mesh is not None:
+            return mesh
+        model = modal_result.get("model")
+        if model is not None:
+            return model.mesh
+        return None
+
+    def _serialize_modal_result(self, payload: dict[str, np.ndarray], meta: dict[str, Any], prefix: str, modal_result: dict[str, Any] | None) -> None:
+        meta[f"{prefix}_present"] = bool(modal_result is not None)
+        if modal_result is None:
+            return
+
+        payload[f"{prefix}_freqs"] = np.asarray(modal_result.get("freqs", []), dtype=float)
+        payload[f"{prefix}_modes_full"] = np.asarray(modal_result.get("modes_full", []), dtype=np.float32)
+        payload[f"{prefix}_omegas_rad_s"] = np.asarray(modal_result.get("omegas_rad_s", []), dtype=float)
+        payload[f"{prefix}_eigenvalues"] = np.asarray(modal_result.get("eigenvalues", []), dtype=float)
+        payload[f"{prefix}_modal_masses"] = np.asarray(modal_result.get("modal_masses", []), dtype=float)
+
+        mesh = self._extract_mesh_data(modal_result)
+        meta[f"{prefix}_mesh_present"] = bool(mesh is not None)
+        if mesh is None:
+            return
+
+        payload[f"{prefix}_mesh_points"] = np.asarray(mesh.points, dtype=float)
+        payload[f"{prefix}_mesh_cells"] = np.asarray(mesh.cells, dtype=np.int64)
+        payload[f"{prefix}_mesh_node_tags"] = np.asarray(mesh.node_tags_gmsh, dtype=np.int64)
+        payload[f"{prefix}_mesh_element_tags"] = (
+            np.asarray(mesh.element_tags_gmsh, dtype=np.int64)
+            if mesh.element_tags_gmsh is not None else np.asarray([], dtype=np.int64)
+        )
+        meta[f"{prefix}_mesh_n_nodes_per_cell"] = int(mesh.n_nodes_per_cell)
+        meta[f"{prefix}_mesh_gmsh_element_type"] = int(mesh.gmsh_element_type)
+        meta[f"{prefix}_mesh_element_order"] = int(mesh.element_order)
+        meta[f"{prefix}_mesh_metadata"] = mesh.metadata
+
+    def _deserialize_modal_result(self, data: Any, meta: dict[str, Any], prefix: str) -> dict[str, Any] | None:
+        if not bool(meta.get(f"{prefix}_present", False)):
+            return None
+
+        result = {
+            "freqs": np.asarray(data[f"{prefix}_freqs"], dtype=float),
+            "frequencies": np.asarray(data[f"{prefix}_freqs"], dtype=float),
+            "modes_full": np.asarray(data[f"{prefix}_modes_full"], dtype=float),
+            "omegas_rad_s": np.asarray(data[f"{prefix}_omegas_rad_s"], dtype=float),
+            "eigenvalues": np.asarray(data[f"{prefix}_eigenvalues"], dtype=float),
+            "modal_masses": np.asarray(data[f"{prefix}_modal_masses"], dtype=float),
+        }
+
+        if bool(meta.get(f"{prefix}_mesh_present", False)):
+            result["mesh_data"] = Mesh3DData(
+                points=np.asarray(data[f"{prefix}_mesh_points"], dtype=float),
+                cells=np.asarray(data[f"{prefix}_mesh_cells"], dtype=np.int64),
+                n_nodes_per_cell=int(meta.get(f"{prefix}_mesh_n_nodes_per_cell", 4)),
+                gmsh_element_type=int(meta.get(f"{prefix}_mesh_gmsh_element_type", 4)),
+                element_order=int(meta.get(f"{prefix}_mesh_element_order", 1)),
+                node_tags_gmsh=np.asarray(data[f"{prefix}_mesh_node_tags"], dtype=np.int64),
+                element_tags_gmsh=np.asarray(data[f"{prefix}_mesh_element_tags"], dtype=np.int64),
+                metadata=dict(meta.get(f"{prefix}_mesh_metadata", {})),
+            )
+        return result
+
+    def _serialize_frf_result(self, payload: dict[str, np.ndarray], meta: dict[str, Any], frf_result: dict[str, Any] | None) -> None:
+        meta["frf_present"] = bool(frf_result is not None)
+        if frf_result is None:
+            return
+        meta["frf_title"] = str(frf_result.get("title", "FRF 3D"))
+        curves = frf_result.get("curves")
+        if curves:
+            meta["frf_kind"] = "overlay"
+            meta["frf_curve_labels"] = [str(c.get("label", "")) for c in curves]
+            for idx, curve in enumerate(curves):
+                payload[f"frf_curve_{idx}_x"] = np.asarray(curve.get("x", []), dtype=float)
+                payload[f"frf_curve_{idx}_y"] = np.asarray(curve.get("y", []), dtype=float)
+        else:
+            meta["frf_kind"] = "single"
+            payload["frf_freq"] = np.asarray(frf_result.get("freq", []), dtype=float)
+            payload["frf_H_real"] = np.asarray(np.real(frf_result.get("H", [])), dtype=float)
+            payload["frf_H_imag"] = np.asarray(np.imag(frf_result.get("H", [])), dtype=float)
+
+    def _deserialize_frf_result(self, data: Any, meta: dict[str, Any]) -> dict[str, Any] | None:
+        if not bool(meta.get("frf_present", False)):
+            return None
+        if str(meta.get("frf_kind", "single")) == "overlay":
+            curves = []
+            labels = list(meta.get("frf_curve_labels", []))
+            for idx, label in enumerate(labels):
+                x_key = f"frf_curve_{idx}_x"
+                y_key = f"frf_curve_{idx}_y"
+                if x_key in data and y_key in data:
+                    curves.append({
+                        "x": np.asarray(data[x_key], dtype=float),
+                        "y": np.asarray(data[y_key], dtype=float),
+                        "label": str(label),
+                    })
+            return {"title": str(meta.get("frf_title", "FRF 3D")), "curves": curves}
+        freq = np.asarray(data["frf_freq"], dtype=float) if "frf_freq" in data else np.asarray([], dtype=float)
+        h_real = np.asarray(data["frf_H_real"], dtype=float) if "frf_H_real" in data else np.asarray([], dtype=float)
+        h_imag = np.asarray(data["frf_H_imag"], dtype=float) if "frf_H_imag" in data else np.asarray([], dtype=float)
+        return {
+            "title": str(meta.get("frf_title", "FRF 3D")),
+            "freq": freq,
+            "H": h_real + 1j * h_imag,
+        }
+
+    def save_ui_cache(
+        self,
+        config_path: str | Path,
+        *,
+        modal_result_uniform: dict[str, Any] | None = None,
+        modal_result_vbh: dict[str, Any] | None = None,
+        frf_result: dict[str, Any] | None = None,
+    ) -> Path | None:
+        cache_path = self._cache_path_from_config(config_path)
+        payload: dict[str, np.ndarray] = {}
+        meta: dict[str, Any] = {}
+
+        self._serialize_modal_result(payload, meta, "modal_uniform", modal_result_uniform)
+        self._serialize_modal_result(payload, meta, "modal_vbh", modal_result_vbh)
+        self._serialize_frf_result(payload, meta, frf_result)
+
+        if not payload and not any(meta.values()):
+            return None
+
+        payload["__meta_json__"] = np.array([json.dumps(meta)], dtype=object)
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(cache_path, **payload)
+        return cache_path
+
+    def load_ui_cache(self, config_path: str | Path) -> dict[str, Any]:
+        cache_path = self._cache_path_from_config(config_path)
+        if not cache_path.exists():
+            return {
+                "cache_path": None,
+                "modal_result_uniform": None,
+                "modal_result_vbh": None,
+                "frf_result": None,
+            }
+
+        with np.load(cache_path, allow_pickle=True) as data:
+            meta = json.loads(str(data["__meta_json__"][0])) if "__meta_json__" in data else {}
+            result = {
+                "cache_path": str(cache_path),
+                "modal_result_uniform": self._deserialize_modal_result(data, meta, "modal_uniform"),
+                "modal_result_vbh": self._deserialize_modal_result(data, meta, "modal_vbh"),
+                "frf_result": self._deserialize_frf_result(data, meta),
+            }
+        return result
+
     def compute_frf(self, params: dict[str, Any]) -> dict[str, Any]:
         """
         Bridge FRF pour l'UI.
@@ -1028,8 +1187,11 @@ class SimulationManager3D:
         component: str = "norm",
         scale: float = 1.0,
     ) -> dict[str, Any]:
-        model: Solid3DFEMModel = modal_result["model"]
-        mesh = model.mesh
+        mesh = modal_result.get("mesh_data")
+        if mesh is None:
+            model = modal_result.get("model")
+            if model is not None:
+                mesh = model.mesh
         if mesh is None:
             raise RuntimeError("Le maillage 3D n'est pas disponible pour l'affichage du mode.")
 
@@ -1064,6 +1226,162 @@ class SimulationManager3D:
             "scalars_name": scalar_name,
             "mode_index": int(mode_index),
         }
+
+    def _cache_path_from_config(self, config_path: str | Path) -> Path:
+        cfg = Path(config_path)
+        return cfg.with_suffix(".session3d.npz")
+
+    def _extract_mesh_data(self, modal_result: dict[str, Any] | None) -> Mesh3DData | None:
+        if not modal_result:
+            return None
+        mesh = modal_result.get("mesh_data")
+        if mesh is not None:
+            return mesh
+        model = modal_result.get("model")
+        if model is not None:
+            return model.mesh
+        return None
+
+    def _serialize_modal_result(self, payload: dict[str, np.ndarray], meta: dict[str, Any], prefix: str, modal_result: dict[str, Any] | None) -> None:
+        meta[f"{prefix}_present"] = bool(modal_result is not None)
+        if modal_result is None:
+            return
+
+        payload[f"{prefix}_freqs"] = np.asarray(modal_result.get("freqs", []), dtype=float)
+        payload[f"{prefix}_modes_full"] = np.asarray(modal_result.get("modes_full", []), dtype=np.float32)
+        payload[f"{prefix}_omegas_rad_s"] = np.asarray(modal_result.get("omegas_rad_s", []), dtype=float)
+        payload[f"{prefix}_eigenvalues"] = np.asarray(modal_result.get("eigenvalues", []), dtype=float)
+        payload[f"{prefix}_modal_masses"] = np.asarray(modal_result.get("modal_masses", []), dtype=float)
+
+        mesh = self._extract_mesh_data(modal_result)
+        meta[f"{prefix}_mesh_present"] = bool(mesh is not None)
+        if mesh is None:
+            return
+
+        payload[f"{prefix}_mesh_points"] = np.asarray(mesh.points, dtype=float)
+        payload[f"{prefix}_mesh_cells"] = np.asarray(mesh.cells, dtype=np.int64)
+        payload[f"{prefix}_mesh_node_tags"] = np.asarray(mesh.node_tags_gmsh, dtype=np.int64)
+        payload[f"{prefix}_mesh_element_tags"] = (
+            np.asarray(mesh.element_tags_gmsh, dtype=np.int64)
+            if mesh.element_tags_gmsh is not None else np.asarray([], dtype=np.int64)
+        )
+        meta[f"{prefix}_mesh_n_nodes_per_cell"] = int(mesh.n_nodes_per_cell)
+        meta[f"{prefix}_mesh_gmsh_element_type"] = int(mesh.gmsh_element_type)
+        meta[f"{prefix}_mesh_element_order"] = int(mesh.element_order)
+        meta[f"{prefix}_mesh_metadata"] = mesh.metadata
+
+    def _deserialize_modal_result(self, data: Any, meta: dict[str, Any], prefix: str) -> dict[str, Any] | None:
+        if not bool(meta.get(f"{prefix}_present", False)):
+            return None
+
+        result = {
+            "freqs": np.asarray(data[f"{prefix}_freqs"], dtype=float),
+            "frequencies": np.asarray(data[f"{prefix}_freqs"], dtype=float),
+            "modes_full": np.asarray(data[f"{prefix}_modes_full"], dtype=float),
+            "omegas_rad_s": np.asarray(data[f"{prefix}_omegas_rad_s"], dtype=float),
+            "eigenvalues": np.asarray(data[f"{prefix}_eigenvalues"], dtype=float),
+            "modal_masses": np.asarray(data[f"{prefix}_modal_masses"], dtype=float),
+        }
+
+        if bool(meta.get(f"{prefix}_mesh_present", False)):
+            result["mesh_data"] = Mesh3DData(
+                points=np.asarray(data[f"{prefix}_mesh_points"], dtype=float),
+                cells=np.asarray(data[f"{prefix}_mesh_cells"], dtype=np.int64),
+                n_nodes_per_cell=int(meta.get(f"{prefix}_mesh_n_nodes_per_cell", 4)),
+                gmsh_element_type=int(meta.get(f"{prefix}_mesh_gmsh_element_type", 4)),
+                element_order=int(meta.get(f"{prefix}_mesh_element_order", 1)),
+                node_tags_gmsh=np.asarray(data[f"{prefix}_mesh_node_tags"], dtype=np.int64),
+                element_tags_gmsh=np.asarray(data[f"{prefix}_mesh_element_tags"], dtype=np.int64),
+                metadata=dict(meta.get(f"{prefix}_mesh_metadata", {})),
+            )
+        return result
+
+    def _serialize_frf_result(self, payload: dict[str, np.ndarray], meta: dict[str, Any], frf_result: dict[str, Any] | None) -> None:
+        meta["frf_present"] = bool(frf_result is not None)
+        if frf_result is None:
+            return
+        meta["frf_title"] = str(frf_result.get("title", "FRF 3D"))
+        curves = frf_result.get("curves")
+        if curves:
+            meta["frf_kind"] = "overlay"
+            meta["frf_curve_labels"] = [str(c.get("label", "")) for c in curves]
+            for idx, curve in enumerate(curves):
+                payload[f"frf_curve_{idx}_x"] = np.asarray(curve.get("x", []), dtype=float)
+                payload[f"frf_curve_{idx}_y"] = np.asarray(curve.get("y", []), dtype=float)
+        else:
+            meta["frf_kind"] = "single"
+            payload["frf_freq"] = np.asarray(frf_result.get("freq", []), dtype=float)
+            payload["frf_H_real"] = np.asarray(np.real(frf_result.get("H", [])), dtype=float)
+            payload["frf_H_imag"] = np.asarray(np.imag(frf_result.get("H", [])), dtype=float)
+
+    def _deserialize_frf_result(self, data: Any, meta: dict[str, Any]) -> dict[str, Any] | None:
+        if not bool(meta.get("frf_present", False)):
+            return None
+        if str(meta.get("frf_kind", "single")) == "overlay":
+            curves = []
+            labels = list(meta.get("frf_curve_labels", []))
+            for idx, label in enumerate(labels):
+                x_key = f"frf_curve_{idx}_x"
+                y_key = f"frf_curve_{idx}_y"
+                if x_key in data and y_key in data:
+                    curves.append({
+                        "x": np.asarray(data[x_key], dtype=float),
+                        "y": np.asarray(data[y_key], dtype=float),
+                        "label": str(label),
+                    })
+            return {"title": str(meta.get("frf_title", "FRF 3D")), "curves": curves}
+        freq = np.asarray(data["frf_freq"], dtype=float) if "frf_freq" in data else np.asarray([], dtype=float)
+        h_real = np.asarray(data["frf_H_real"], dtype=float) if "frf_H_real" in data else np.asarray([], dtype=float)
+        h_imag = np.asarray(data["frf_H_imag"], dtype=float) if "frf_H_imag" in data else np.asarray([], dtype=float)
+        return {
+            "title": str(meta.get("frf_title", "FRF 3D")),
+            "freq": freq,
+            "H": h_real + 1j * h_imag,
+        }
+
+    def save_ui_cache(
+        self,
+        config_path: str | Path,
+        *,
+        modal_result_uniform: dict[str, Any] | None = None,
+        modal_result_vbh: dict[str, Any] | None = None,
+        frf_result: dict[str, Any] | None = None,
+    ) -> Path | None:
+        cache_path = self._cache_path_from_config(config_path)
+        payload: dict[str, np.ndarray] = {}
+        meta: dict[str, Any] = {}
+
+        self._serialize_modal_result(payload, meta, "modal_uniform", modal_result_uniform)
+        self._serialize_modal_result(payload, meta, "modal_vbh", modal_result_vbh)
+        self._serialize_frf_result(payload, meta, frf_result)
+
+        if not payload and not any(meta.values()):
+            return None
+
+        payload["__meta_json__"] = np.array([json.dumps(meta)], dtype=object)
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(cache_path, **payload)
+        return cache_path
+
+    def load_ui_cache(self, config_path: str | Path) -> dict[str, Any]:
+        cache_path = self._cache_path_from_config(config_path)
+        if not cache_path.exists():
+            return {
+                "cache_path": None,
+                "modal_result_uniform": None,
+                "modal_result_vbh": None,
+                "frf_result": None,
+            }
+
+        with np.load(cache_path, allow_pickle=True) as data:
+            meta = json.loads(str(data["__meta_json__"][0])) if "__meta_json__" in data else {}
+            result = {
+                "cache_path": str(cache_path),
+                "modal_result_uniform": self._deserialize_modal_result(data, meta, "modal_uniform"),
+                "modal_result_vbh": self._deserialize_modal_result(data, meta, "modal_vbh"),
+                "frf_result": self._deserialize_frf_result(data, meta),
+            }
+        return result
 
     def compute_frf(self, params: dict[str, Any]) -> dict[str, Any]:
         self._apply_ui_params(params)
