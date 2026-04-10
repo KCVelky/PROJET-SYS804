@@ -168,6 +168,7 @@ class SimulationManager3D:
 
     def set_mesh(
         self,
+        reuse_saved_msh: bool = False,
         element_order: int = 2,
         global_size: float = 0.012,
         local_size: float = 0.004,
@@ -188,6 +189,7 @@ class SimulationManager3D:
         high_order_iter_max: int = 100,
     ) -> None:
         self.mesh_params = {
+            "reuse_saved_msh": reuse_saved_msh,
             "element_order": element_order,
             "global_size": global_size,
             "local_size": local_size,
@@ -523,6 +525,7 @@ class SimulationManager3D:
         local_ref_radius = 0.60 * radius if refine_vbh else max(radius, h_global)
 
         self.set_mesh(
+            reuse_saved_msh=False,
             element_order=int(mesh.get("order", 2)),
             global_size=h_global,
             local_size=h_local,
